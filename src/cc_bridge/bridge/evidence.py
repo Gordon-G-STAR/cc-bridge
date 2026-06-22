@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import scope
+from . import scope, snapshot
 
 _UNVERIFIABLE_REASON = "index flag hides on-disk state (skip-worktree/assume-unchanged)"
 _OUTSIDE_SCOPE_REASON = "outside granted writable scope"
@@ -18,6 +18,25 @@ class EvidenceResult:
     unverifiable: list[str]
     evidence_level: str
     reasons: dict[str, str]
+
+
+def baseline(root) -> dict[str, str | None]:
+    return snapshot.snapshot_files(root, snapshot.list_snapshot_targets(root))
+
+
+def gather(root, baseline_snapshot, writable_paths=()) -> EvidenceResult:
+    targets = snapshot.list_snapshot_targets(root)
+    after = snapshot.snapshot_files(root, targets)
+    changed = snapshot.diff_snapshots(baseline_snapshot, after)
+    unver = snapshot.unverifiable_paths(root)
+    git_available = snapshot.is_git_repo(root)
+    return classify_changes(
+        root,
+        changed,
+        list(writable_paths),
+        unverifiable=unver,
+        git_available=git_available,
+    )
 
 
 def _normalize_relpaths(paths) -> list[str]:

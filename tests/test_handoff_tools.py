@@ -7,6 +7,8 @@ HandoffResult,fail-closed,绝不向 MCP 抛异常。
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -20,6 +22,11 @@ from cc_bridge.bridge.contracts import (
 )
 from cc_bridge.bridge.executor import AgentExecutor, ExecutionResult
 from cc_bridge.bridge.locks import LockBusy
+
+
+def _hide_parent_git_repo(monkeypatch) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(project_root))
 
 
 @pytest.fixture(autouse=True)
@@ -57,11 +64,45 @@ def _req(writable=None) -> HandoffRequest:
     )
 
 
+def _run_git(repo, *args) -> None:
+    git = config.resolve_cli("git")
+    if git is None:
+        pytest.skip("git is required for snapshot evidence tests")
+    subprocess.run(
+        [git, *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _init_git_repo(repo) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _run_git(repo, "init")
+    (repo / "README.md").write_text("init\n", encoding="utf-8")
+    _run_git(repo, "add", "README.md")
+    _run_git(
+        repo,
+        "-c",
+        "user.name=cc-bridge test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "init",
+    )
+
+
 # ---------------------------------------------------------------------------
 # codex_handoff
 # ---------------------------------------------------------------------------
 
 async def test_codex_handoff_forces_read_only_and_returns_structured(monkeypatch, tmp_path):
+    _hide_parent_git_repo(monkeypatch)
     calls: list[dict] = []
 
     async def _fake(self, prompt, cwd, **kwargs):
@@ -77,7 +118,7 @@ async def test_codex_handoff_forces_read_only_and_returns_structured(monkeypatch
     assert isinstance(res, HandoffResult)
     assert res.status == "completed"
     assert res.agent_used == "codex"
-    assert res.evidence_level == "unknown"        # 无证据子系统,绝不声称 verified
+    assert res.evidence_level == "unknown"
     assert res.verified_files_changed == []
     assert res.token_usage == {"t": 1}
     assert calls[0]["sandbox_override"] == "read-only"  # 骨架强制只读
@@ -163,6 +204,7 @@ async def test_codex_handoff_timeout_maps_failure_kind(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 async def test_claude_handoff_forces_plan_mode(monkeypatch, tmp_path):
+    _hide_parent_git_repo(monkeypatch)
     calls: list[dict] = []
 
     async def _fake(self, prompt, cwd, **kwargs):
@@ -278,16 +320,26 @@ async def test_codex_handoff_continue_session_reuses(monkeypatch, tmp_path):
 
 async def test_codex_handoff_readonly_anomaly_is_flagged(monkeypatch, tmp_path):
     """只读执行却报告文件改动 => 必须显式标成 scope_violation,绝不静默吞掉。"""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
 
     async def _fake(self, prompt, cwd, **kwargs):
+        path = repo / "src" / "x.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("x = 1\n", encoding="utf-8")
         return ExecutionResult(
-            success=True, output="ok", files_changed=["src/x.py"], duration_seconds=1.0
+            success=True,
+            output="ok",
+            files_changed=["reported-only.py"],
+            duration_seconds=1.0,
         )
 
     monkeypatch.setattr(AgentExecutor, "run_codex", _fake)
 
-    res = await mcp_to_codex.codex_handoff(_req(), project_dir=str(tmp_path))
+    res = await mcp_to_codex.codex_handoff(_req(), project_dir=str(repo))
     assert res.status == "scope_violation"
     assert res.scope_violations == ["src/x.py"]
+    assert "reported-only.py" not in res.scope_violations
     assert res.failure_kind is FailureKind.scope_violation
     assert res.verified_files_changed == []   # 仍不声称 verified
+    assert res.side_effects.worktree_files == "detected_but_not_reverted"

@@ -17,6 +17,23 @@ def _decode_git_stdout(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def is_git_repo(root) -> bool:
+    git = _git_or_none()
+    if not git:
+        return False
+
+    result = config.git_capture(
+        git,
+        os.fspath(root),
+        ["rev-parse", "--is-inside-work-tree"],
+        timeout=_GIT_SNAPSHOT_TIMEOUT_SECONDS,
+    )
+    return (
+        result.returncode == 0
+        and _decode_git_stdout(result.stdout).strip() == "true"
+    )
+
+
 def _normalize_relpath(path: str) -> str:
     return path.replace("\\", "/")
 

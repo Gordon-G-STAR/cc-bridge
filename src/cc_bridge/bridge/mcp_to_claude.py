@@ -19,7 +19,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import config
+from . import config, evidence
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
@@ -232,6 +232,7 @@ async def claude_handoff(
             status="failed",
         )
     try:
+        before = evidence.baseline(cwd)
         on_progress = _make_progress_callback(ctx)
         project_ctx = await asyncio.to_thread(
             ContextBuilder().build_project_context, cwd
@@ -253,6 +254,7 @@ async def claude_handoff(
             )
             if result.session_id:
                 _remember_claude_session(cwd, result.session_id)
+        ev = evidence.gather(cwd, before, writable_paths=())
         append_audit_record(
             direction="claude",
             cwd=cwd,
@@ -262,7 +264,9 @@ async def claude_handoff(
         )
         parsed = ResultParser().parse(result, "claude")
         summary = ResultParser().summarize_for_caller(parsed, "claude")
-        return execution_to_handoff(handoff_id, request, result, summary, "claude")
+        return execution_to_handoff(
+            handoff_id, request, result, summary, "claude", evidence=ev
+        )
     except LockBusy:
         return fail_closed_result(
             handoff_id,

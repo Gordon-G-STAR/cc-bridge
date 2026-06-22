@@ -1,6 +1,44 @@
 from __future__ import annotations
 
-from cc_bridge.bridge.evidence import classify_changes
+import subprocess
+
+import pytest
+
+from cc_bridge.bridge import config
+from cc_bridge.bridge.evidence import baseline, classify_changes, gather
+
+
+def _run_git(repo, *args) -> None:
+    git = config.resolve_cli("git")
+    if git is None:
+        pytest.skip("git is required for snapshot evidence tests")
+    subprocess.run(
+        [git, *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _init_git_repo(repo) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _run_git(repo, "init")
+    (repo / "README.md").write_text("init\n", encoding="utf-8")
+    _run_git(repo, "add", "README.md")
+    _run_git(
+        repo,
+        "-c",
+        "user.name=cc-bridge test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "init",
+    )
 
 
 def test_empty_writable_scope_reports_changed_file_outside_scope(tmp_path):
@@ -88,3 +126,21 @@ def test_git_unavailable_sets_unknown_evidence_level(tmp_path):
 
     assert result.verified_files == ["src/auth/x.py"]
     assert result.evidence_level == "unknown"
+
+
+def test_baseline_gather_flags_new_file_outside_writable_scope(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    before = baseline(repo)
+
+    path = repo / "src" / "new.py"
+    path.parent.mkdir()
+    path.write_text("x = 1\n", encoding="utf-8")
+
+    result = gather(repo, before, writable_paths=())
+
+    assert result.verified_files == []
+    assert result.scope_violations == ["src/new.py"]
+    assert result.unverifiable == []
+    assert result.evidence_level == "verified"
+    assert result.reasons == {"src/new.py": "outside granted writable scope"}

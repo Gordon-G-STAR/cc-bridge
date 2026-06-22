@@ -14,7 +14,14 @@
 
 from __future__ import annotations
 
-from .contracts import CONTRACT_VERSION, FailureKind, HandoffRequest, HandoffResult
+from .contracts import (
+    CONTRACT_VERSION,
+    FailureKind,
+    HandoffRequest,
+    HandoffResult,
+    SideEffects,
+)
+from .evidence import EvidenceResult
 from .executor import ExecutionResult
 
 READONLY_SKELETON_NOTE = (
@@ -39,6 +46,7 @@ def execution_to_handoff(
     result: ExecutionResult,
     summary: str,
     agent: str,
+    evidence: EvidenceResult | None = None,
 ) -> HandoffResult:
     """把一次只读执行的 ExecutionResult 装配成结构化 HandoffResult。"""
     failure_kind: FailureKind | None = None
@@ -54,6 +62,32 @@ def execution_to_handoff(
     route = f"{agent}(只读骨架)"
     if request.requested_scope.writable_paths:
         route = f"{route};{READONLY_SKELETON_NOTE}"
+
+    if evidence is not None:
+        if evidence.scope_violations:
+            status = "scope_violation"
+            failure_kind = FailureKind.scope_violation
+            worktree_files = "detected_but_not_reverted"
+        else:
+            status = "completed" if result.success else "failed"
+            worktree_files = "none"
+
+        return HandoffResult(
+            contract_version=CONTRACT_VERSION,
+            handoff_id=handoff_id,
+            status=status,
+            agent_used=agent,
+            route_reason=route,
+            summary=summary,
+            verified_files_changed=evidence.verified_files,
+            scope_violations=evidence.scope_violations,
+            checks=[],
+            failure_kind=failure_kind,
+            side_effects=SideEffects(worktree_files=worktree_files),
+            duration_seconds=result.duration_seconds,
+            token_usage=result.token_usage,
+            evidence_level=evidence.evidence_level,
+        )
 
     # 防御性:只读执行【绝不该】报告文件改动。一旦出现(沙箱被绕过 / 底层只读保护
     # 失效),骨架虽无证据子系统去归因,但绝不能静默吞掉——显式标成 scope_violation。

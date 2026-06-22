@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -29,6 +30,11 @@ def _run_git(git: str, cwd, args: list[str]) -> subprocess.CompletedProcess:
         check=True,
         text=True,
     )
+
+
+def _hide_parent_git_repo(monkeypatch) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(project_root))
 
 
 def _make_git_repo(tmp_path):
@@ -125,6 +131,17 @@ def test_list_snapshot_targets_includes_tracked_and_untracked_files(tmp_path):
     assert ".gitignore" in targets
     assert "ignored.txt" not in targets
     assert all(not path.startswith(".git/") for path in targets)
+
+
+def test_is_git_repo_detects_repo_and_plain_directory(tmp_path, monkeypatch):
+    _hide_parent_git_repo(monkeypatch)
+    snapshot = _snapshot_module()
+    _git, repo = _make_git_repo(tmp_path)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    assert snapshot.is_git_repo(repo) is True
+    assert snapshot.is_git_repo(plain) is False
 
 
 def test_unverifiable_paths_reports_skip_worktree_file(tmp_path):
