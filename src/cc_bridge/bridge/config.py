@@ -226,7 +226,20 @@ _GIT_SAFE_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "Never",
     "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",  # 忽略系统级 gitconfig(供应链 / 共享机器硬化)
 }
+
+# 桥自己的 git 调用全部叠加这组硬化标志,中和「agent 写 .git/config 或 .gitattributes
+# 后,桥的 git 调用替它执行代码」的通道(hooks / pager / 凭据助手 / ssh)。注意:这【不是】
+# 完整封堵——repo 本地 .git/config 无法被 git 忽略;真正承重的防御是「任何 .git/ 写入判
+# critical」(见 scope.is_dotgit_path)+ PR4 直接哈希磁盘原始字节(绕开会应用 filter 的命令)。
+_GIT_HARDENING_FLAGS = [
+    "--no-pager",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=" + os.devnull,
+    "-c", "core.askpass=",
+    "-c", "core.sshCommand=false",
+]
 
 
 def _kill_proc_tree(proc: "subprocess.Popen") -> None:
@@ -299,7 +312,7 @@ def git_capture(git: str, cwd: str, args: list[str], *, timeout: int) -> Capture
       继承并持有管道句柄，正是 Windows ``subprocess.run`` 超时死锁的孙进程来源；
     - 配 :data:`_GIT_SAFE_ENV`：禁交互凭据/锁争用。
     """
-    argv = [git, "-c", "core.fsmonitor=false", "-C", str(cwd), *args]
+    argv = [git, *_GIT_HARDENING_FLAGS, "-C", str(cwd), *args]
     return run_capture(argv, timeout=timeout, extra_env=_GIT_SAFE_ENV)
 
 

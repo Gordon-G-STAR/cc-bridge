@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from cc_bridge.bridge.scope import (
+    is_dotgit_path,
     is_reserved_component,
     is_within,
     path_has_ads,
@@ -165,3 +166,16 @@ def test_junction_detected_on_windows(tmp_path):
         pytest.skip(f"无法创建 junction: {res.stderr or res.stdout}")
     assert reparse_tag(junction) is not None
     assert "junction" in path_taints(junction)
+
+
+def test_dotgit_detection():
+    assert is_dotgit_path(".git/hooks/pre-commit")
+    assert is_dotgit_path("a/.git/config")
+    assert is_dotgit_path(".git")
+    assert not is_dotgit_path("src/git/x")        # 'git' != '.git'
+    assert not is_dotgit_path("src/.github/ci")   # '.github' != '.git'
+
+
+def test_resolve_flags_dotgit(tmp_path):
+    assert "dotgit" in resolve_within_root(".git/config", str(tmp_path)).taints
+    assert "dotgit" in path_taints(".git/hooks/x")

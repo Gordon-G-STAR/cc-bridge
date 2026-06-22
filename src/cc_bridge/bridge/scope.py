@@ -89,6 +89,16 @@ def path_has_ads(path_str: str) -> bool:
     return ":" in body
 
 
+def is_dotgit_path(path_str: str) -> bool:
+    """路径是否触及 ``.git/``(任何分量为 ``.git``)。
+
+    agent 写 ``.git/`` 是 critical 越界:它会污染桥自己后续的 git 快照调用
+    (hooks / filters / config),把"验证安全"的证据机制反过来变成执行通道。
+    """
+    norm = str(path_str).replace("\\", "/")
+    return any(c == ".git" for c in norm.split("/") if c)
+
+
 def hardlink_count(path) -> int | None:
     try:
         return os.stat(path).st_nlink
@@ -130,6 +140,8 @@ def path_taints(path) -> list[str]:
         taints.append("ads")
     if path_has_reserved_name(p):
         taints.append("reserved_name")
+    if is_dotgit_path(p):
+        taints.append("dotgit")
     nlink = hardlink_count(path)
     if nlink is not None and nlink > 1:
         taints.append("hardlink_aliased")
@@ -195,6 +207,8 @@ def resolve_within_root(requested: str, project_root: str) -> ResolvedPathIdenti
         detected.append("ads")
     if path_has_reserved_name(requested):
         detected.append("reserved_name")
+    if is_dotgit_path(requested):
+        detected.append("dotgit")
     if is_symlink or raw.exists():
         for tag in path_taints(raw):
             if tag not in detected:
