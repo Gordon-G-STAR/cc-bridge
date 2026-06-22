@@ -10,6 +10,8 @@ claude_status 返回非空字符串。
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from cc_bridge.bridge import mcp_to_claude
@@ -28,12 +30,27 @@ def light_context(monkeypatch):
 
 
 def _patch_run_claude(monkeypatch, result=None, exc=None):
-    async def _fake_run_claude(self, prompt, cwd, timeout=None, on_progress=None):
+    async def _fake_run_claude(
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+    ):
         if exc is not None:
             raise exc
         return result
 
     monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+
+@pytest.fixture(autouse=True)
+def clear_claude_session_cache():
+    if hasattr(mcp_to_claude, "_CLAUDE_SESSIONS_BY_PROJECT"):
+        mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT.clear()
+    if hasattr(mcp_to_claude, "_CLAUDE_SESSION_LOCKS_BY_PROJECT"):
+        mcp_to_claude._CLAUDE_SESSION_LOCKS_BY_PROJECT.clear()
+    yield
+    if hasattr(mcp_to_claude, "_CLAUDE_SESSIONS_BY_PROJECT"):
+        mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT.clear()
+    if hasattr(mcp_to_claude, "_CLAUDE_SESSION_LOCKS_BY_PROJECT"):
+        mcp_to_claude._CLAUDE_SESSION_LOCKS_BY_PROJECT.clear()
 
 
 async def test_claude_analyze_success(monkeypatch, tmp_path):
@@ -53,6 +70,98 @@ async def test_claude_analyze_success(monkeypatch, tmp_path):
     assert "已完成" in out
     assert "改动文件" in out
     assert "docs/review.md" in out
+
+
+async def test_claude_analyze_returns_and_reuses_session_id(monkeypatch, tmp_path):
+    calls: list[str | None] = []
+
+    async def _fake_run_claude(
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+    ):
+        calls.append(resume_session_id)
+        return ExecutionResult(
+            success=True,
+            output="ok",
+            duration_seconds=1.0,
+            session_id=resume_session_id or "sid-first",
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+    first = await mcp_to_claude.claude_analyze("first", project_dir=str(tmp_path))
+    second = await mcp_to_claude.claude_analyze(
+        "second", project_dir=str(tmp_path), continue_session=True
+    )
+
+    assert calls == [None, "sid-first"]
+    assert "sid-first" in first
+    assert "sid-first" in second
+
+
+async def test_claude_analyze_continue_session_serializes_per_project(
+    monkeypatch, tmp_path
+):
+    cwd = str(tmp_path.resolve())
+    mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT[cwd] = "sid-old"
+    calls: list[str | None] = []
+    active = 0
+    max_active = 0
+
+    async def _fake_run_claude(
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+    ):
+        nonlocal active, max_active
+        calls.append(resume_session_id)
+        call_no = len(calls)
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            active -= 1
+        return ExecutionResult(
+            success=True,
+            output="ok",
+            duration_seconds=1.0,
+            session_id="sid-first" if call_no == 1 else "sid-second",
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+    await asyncio.gather(
+        mcp_to_claude.claude_analyze(
+            "continue 1", project_dir=str(tmp_path), continue_session=True
+        ),
+        mcp_to_claude.claude_analyze(
+            "continue 2", project_dir=str(tmp_path), continue_session=True
+        ),
+    )
+
+    assert max_active == 1
+    assert calls == ["sid-old", "sid-first"]
+    assert mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT[cwd] == "sid-second"
+
+
+async def test_claude_analyze_continue_false_starts_new_session(monkeypatch, tmp_path):
+    cwd = str(tmp_path.resolve())
+    mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT[cwd] = "sid-old"
+    calls: list[str | None] = []
+
+    async def _fake_run_claude(
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+    ):
+        calls.append(resume_session_id)
+        return ExecutionResult(success=True, output="ok", session_id="sid-new")
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+    out = await mcp_to_claude.claude_analyze(
+        "no continue", project_dir=str(tmp_path), continue_session=False
+    )
+
+    assert calls == [None]
+    assert mcp_to_claude._CLAUDE_SESSIONS_BY_PROJECT[cwd] == "sid-new"
+    assert "sid-new" in out
 
 
 async def test_claude_analyze_failure_result_is_string(monkeypatch, tmp_path):

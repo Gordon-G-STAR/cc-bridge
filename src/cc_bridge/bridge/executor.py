@@ -42,7 +42,7 @@ class ExecutionResult:
     error: str | None = None
     duration_seconds: float = 0.0
     token_usage: dict | None = None    # 能解析出来时填入
-    session_id: str | None = None      # Codex 会话 ID；Claude 方向为 None
+    session_id: str | None = None      # agent 会话 ID；用于后续续接
     exit_code: int | None = None
     timed_out: bool = False
     raw_stdout: str = ""               # 原始输出，供 parser 进一步处理 / 调试
@@ -540,6 +540,20 @@ def _extract_codex_session_id(stdout_jsonl: str) -> str | None:
     return None
 
 
+def _extract_claude_session_id(stdout_json: str) -> str | None:
+    """从 ``claude -p --output-format json`` 的单 JSON 输出里提取 session id。"""
+    stdout_json = stdout_json.strip()
+    if not stdout_json:
+        return None
+    try:
+        data = json.loads(stdout_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _find_codex_session_id(data)
+
+
 # ---------------------------------------------------------------------------
 # 执行器
 # ---------------------------------------------------------------------------
@@ -556,6 +570,7 @@ class AgentExecutor:
         prompt: str,
         cwd: str,
         timeout: int | None = None,
+        resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> ExecutionResult:
         exe = config.resolve_cli("claude")
@@ -565,8 +580,18 @@ class AgentExecutor:
         args = ["-p", "--output-format", "json", "--permission-mode", self.cfg.claude_permission_mode]
         if self.cfg.claude_model:
             args += ["--model", self.cfg.claude_model]
+        if resume_session_id:
+            args += ["--resume", resume_session_id]
         argv = config.build_launch_argv(exe, args)
-        return await self._invoke("claude", argv, prompt, cwd, timeout, on_progress=on_progress)
+        return await self._invoke(
+            "claude",
+            argv,
+            prompt,
+            cwd,
+            timeout,
+            on_progress=on_progress,
+            session_id_hint=resume_session_id,
+        )
 
     # -- Codex ------------------------------------------------------------
     async def run_codex(
@@ -722,6 +747,8 @@ class AgentExecutor:
         session_id = None
         if agent == "codex":
             session_id = _extract_codex_session_id(stdout) or session_id_hint
+        elif agent == "claude":
+            session_id = _extract_claude_session_id(stdout) or session_id_hint
 
         error = None
         if timed_out:

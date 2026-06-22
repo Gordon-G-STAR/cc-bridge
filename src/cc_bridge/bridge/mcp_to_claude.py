@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -24,6 +25,58 @@ from .parser import ResultParser
 from .status import check_claude
 
 mcp = FastMCP("bridge-to-claude")
+
+_CLAUDE_SESSIONS_BY_PROJECT: dict[str, str] = {}
+_CLAUDE_SESSION_LOCKS_BY_PROJECT: dict[str, asyncio.Lock] = {}
+_CLAUDE_SESSION_CACHE_MAX_PROJECTS = 256
+
+
+def _trim_claude_session_caches(protected_cwd: str | None = None) -> None:
+    max_projects = _CLAUDE_SESSION_CACHE_MAX_PROJECTS
+    if max_projects < 1:
+        max_projects = 1
+
+    def _project_count() -> int:
+        return len(
+            set(_CLAUDE_SESSIONS_BY_PROJECT) | set(_CLAUDE_SESSION_LOCKS_BY_PROJECT)
+        )
+
+    while _project_count() > max_projects:
+        candidates = [
+            *list(_CLAUDE_SESSION_LOCKS_BY_PROJECT),
+            *[
+                cwd
+                for cwd in _CLAUDE_SESSIONS_BY_PROJECT
+                if cwd not in _CLAUDE_SESSION_LOCKS_BY_PROJECT
+            ],
+        ]
+        evicted = False
+        for cwd in candidates:
+            if cwd == protected_cwd:
+                continue
+            lock = _CLAUDE_SESSION_LOCKS_BY_PROJECT.get(cwd)
+            if lock is not None and lock.locked():
+                continue
+            _CLAUDE_SESSION_LOCKS_BY_PROJECT.pop(cwd, None)
+            _CLAUDE_SESSIONS_BY_PROJECT.pop(cwd, None)
+            evicted = True
+            break
+        if not evicted:
+            break
+
+
+def _claude_session_lock(cwd: str) -> asyncio.Lock:
+    lock = _CLAUDE_SESSION_LOCKS_BY_PROJECT.get(cwd)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CLAUDE_SESSION_LOCKS_BY_PROJECT[cwd] = lock
+        _trim_claude_session_caches(protected_cwd=cwd)
+    return lock
+
+
+def _remember_claude_session(cwd: str, session_id: str) -> None:
+    _CLAUDE_SESSIONS_BY_PROJECT[cwd] = session_id
+    _trim_claude_session_caches(protected_cwd=cwd)
 
 
 def _make_progress_callback(ctx: Context | None):
@@ -76,6 +129,7 @@ def _make_progress_callback(ctx: Context | None):
 async def claude_analyze(
     task: str,
     project_dir: str | None = None,
+    continue_session: bool = False,
     ctx: Context = None,
 ) -> str:
     """让 Claude 在 ``project_dir`` 里处理 ``task``，返回结果摘要字符串。
@@ -84,8 +138,8 @@ async def claude_analyze(
     绝不把异常抛给 MCP 框架。
     """
     try:
-        cwd = require_project_dir(project_dir)
-    except ValueError as exc:
+        cwd = str(Path(require_project_dir(project_dir)).resolve())
+    except (OSError, ValueError) as exc:
         return f"无法调用 Claude：{exc}"
     try:
         on_progress = _make_progress_callback(ctx)
@@ -95,7 +149,18 @@ async def claude_analyze(
         project_ctx = await asyncio.to_thread(ContextBuilder().build_project_context, cwd)
         config.debug_log("claude_analyze: 上下文就绪，开始调用 Claude")
         prompt = ContextBuilder().build_task_prompt(task, project_ctx, caller="codex")
-        result = await AgentExecutor().run_claude(prompt, cwd, on_progress=on_progress)
+        async with _claude_session_lock(cwd):
+            resume_session_id = (
+                _CLAUDE_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
+            )
+            result = await AgentExecutor().run_claude(
+                prompt,
+                cwd,
+                resume_session_id=resume_session_id,
+                on_progress=on_progress,
+            )
+            if result.session_id:
+                _remember_claude_session(cwd, result.session_id)
         config.debug_log(f"claude_analyze: Claude 返回 success={result.success}")
         parsed = ResultParser().parse(result, "claude")
         return ResultParser().summarize_for_caller(parsed, "claude")

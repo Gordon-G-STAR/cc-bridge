@@ -424,6 +424,43 @@ async def test_run_claude_argv_uses_print_json(
         assert bad not in argv
 
 
+async def test_run_claude_resume_argv_uses_session_and_stdin(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    fake = fake_run_factory(stdout="{}")
+    _install_fake_run(monkeypatch, fake)
+
+    cfg = ex.config.BridgeConfig(claude_model="opus")
+    await ex.AgentExecutor(cfg).run_claude(
+        "continue work", str(tmp_path), resume_session_id="sid-claude"
+    )
+    argv = fake.calls[0]["argv"]
+
+    assert "-p" in argv
+    assert "--output-format" in argv and "json" in argv
+    assert "--permission-mode" in argv
+    assert "--resume" in argv and "sid-claude" in argv
+    assert "--model" in argv and "opus" in argv
+    assert "continue work" not in argv
+    assert fake.calls[0]["stdin_text"] == "continue work"
+
+
+async def test_run_claude_captures_session_id_from_json(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    payload = {"result": "ok", "session_id": "sid-json"}
+    fake = fake_run_factory(stdout=json.dumps(payload), returncode=0)
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.session_id == "sid-json"
+
+
 # ---------------------------------------------------------------------------
 # 启动失败 / 工作目录无效
 # ---------------------------------------------------------------------------
