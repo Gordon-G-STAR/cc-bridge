@@ -158,3 +158,83 @@ async def test_claude_handoff_bad_project_dir_is_fail_closed(monkeypatch):
     res = await mcp_to_claude.claude_handoff(_req(), project_dir="relative/dir")
     assert res.status == "failed"
     assert res.failure_kind is FailureKind.invalid_contract
+
+
+async def test_claude_handoff_swallows_exception(monkeypatch, tmp_path):
+    async def _boom(self, *a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _boom)
+
+    res = await mcp_to_claude.claude_handoff(_req(), project_dir=str(tmp_path))
+    assert res.status == "failed"
+    assert res.failure_kind is FailureKind.crashed
+
+
+async def test_claude_handoff_timeout_maps_kind(monkeypatch, tmp_path):
+    async def _fake(self, prompt, cwd, **kwargs):
+        return ExecutionResult(
+            success=False, output="", timed_out=True, duration_seconds=1.0
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake)
+
+    res = await mcp_to_claude.claude_handoff(_req(), project_dir=str(tmp_path))
+    assert res.status == "failed"
+    assert res.failure_kind is FailureKind.timeout
+
+
+# ---------------------------------------------------------------------------
+# Codex 复审驱动:agent_unavailable 映射、续接、以及"只读却报告改动"的异常防御
+# ---------------------------------------------------------------------------
+
+async def test_codex_handoff_agent_unavailable_maps_kind(monkeypatch, tmp_path):
+    async def _fake(self, prompt, cwd, **kwargs):
+        # exit_code=None 且非超时、非成功 => agent_unavailable
+        return ExecutionResult(
+            success=False, output="", exit_code=None, duration_seconds=0.1
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake)
+
+    res = await mcp_to_codex.codex_handoff(_req(), project_dir=str(tmp_path))
+    assert res.status == "failed"
+    assert res.failure_kind is FailureKind.agent_unavailable
+
+
+async def test_codex_handoff_continue_session_reuses(monkeypatch, tmp_path):
+    calls: list[str | None] = []
+
+    async def _fake(self, prompt, cwd, **kwargs):
+        calls.append(kwargs.get("resume_session_id"))
+        return ExecutionResult(
+            success=True,
+            output="ok",
+            session_id=kwargs.get("resume_session_id") or "sid-1",
+            duration_seconds=1.0,
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake)
+
+    await mcp_to_codex.codex_handoff(_req(), project_dir=str(tmp_path))
+    await mcp_to_codex.codex_handoff(
+        _req(), project_dir=str(tmp_path), continue_session=True
+    )
+    assert calls == [None, "sid-1"]
+
+
+async def test_codex_handoff_readonly_anomaly_is_flagged(monkeypatch, tmp_path):
+    """只读执行却报告文件改动 => 必须显式标成 scope_violation,绝不静默吞掉。"""
+
+    async def _fake(self, prompt, cwd, **kwargs):
+        return ExecutionResult(
+            success=True, output="ok", files_changed=["src/x.py"], duration_seconds=1.0
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake)
+
+    res = await mcp_to_codex.codex_handoff(_req(), project_dir=str(tmp_path))
+    assert res.status == "scope_violation"
+    assert res.scope_violations == ["src/x.py"]
+    assert res.failure_kind is FailureKind.scope_violation
+    assert res.verified_files_changed == []   # 仍不声称 verified

@@ -50,19 +50,30 @@ def execution_to_handoff(
         else:
             failure_kind = FailureKind.crashed
 
+    status = "completed" if result.success else "failed"
     route = f"{agent}(只读骨架)"
     if request.requested_scope.writable_paths:
         route = f"{route};{READONLY_SKELETON_NOTE}"
 
+    # 防御性:只读执行【绝不该】报告文件改动。一旦出现(沙箱被绕过 / 底层只读保护
+    # 失效),骨架虽无证据子系统去归因,但绝不能静默吞掉——显式标成 scope_violation。
+    scope_violations: list[str] = []
+    files_changed = list(result.files_changed or [])
+    if files_changed:
+        status = "scope_violation"
+        scope_violations = files_changed
+        failure_kind = FailureKind.scope_violation
+        route = f"{route};异常:只读执行却检测到文件改动 {files_changed},已标为越界"
+
     return HandoffResult(
         contract_version=CONTRACT_VERSION,
         handoff_id=handoff_id,
-        status="completed" if result.success else "failed",
+        status=status,
         agent_used=agent,            # "codex" / "claude"
         route_reason=route,
         summary=summary,
-        verified_files_changed=[],   # 骨架只读 + 无证据子系统 => 绝不声称 verified
-        scope_violations=[],
+        verified_files_changed=[],   # 骨架不声称 verified(PR4 才有证据)
+        scope_violations=scope_violations,
         checks=[],
         failure_kind=failure_kind,
         duration_seconds=result.duration_seconds,
