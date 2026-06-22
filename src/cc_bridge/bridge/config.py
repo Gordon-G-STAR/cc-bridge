@@ -123,6 +123,88 @@ def subprocess_creation_kwargs() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 子进程环境白名单（P0.1：不再把父进程整份环境泄给 agent 子进程）
+# ---------------------------------------------------------------------------
+
+# 命中即剔除的敏感变量名模式（大小写不敏感、子串匹配）。
+# 刻意【不】含会误伤的子串：例如绝不用 "PAT"（会命中 PATH）。
+_SENSITIVE_ENV_PATTERNS = (
+    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "APIKEY",
+)
+
+# 始终透传的、子进程启动/联网【必需】的变量名。Windows 上按大小写不敏感匹配，
+# 所以同一变量只列一次即可。清单刻意偏宽——allow-list 太严会让 codex/claude 起不来；
+# 还缺什么用 CC_BRIDGE_ENV_PASSTHROUGH 一行补，不必改代码。
+_BASE_ENV_ALLOW = (
+    # 通用 / POSIX
+    "PATH", "PATHEXT", "HOME", "SHELL", "USER", "LOGNAME",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+    "TEMP", "TMP", "TMPDIR", "XDG_RUNTIME_DIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
+    # Windows 启动必需
+    "SystemRoot", "windir", "SystemDrive", "ComSpec", "OS", "COMPUTERNAME",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
+    "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "USERNAME", "USERPROFILE", "USERDOMAIN", "USERDOMAIN_ROAMINGPROFILE",
+    "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "SESSIONNAME", "DriverData",
+    "APPDATA", "LOCALAPPDATA", "ProgramData", "ALLUSERSPROFILE", "PUBLIC",
+    "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+    "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+    # node / npm（codex / claude CLI 多为 node 实现）
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
+    "NPM_CONFIG_PREFIX", "NVM_DIR", "NVM_HOME", "NVM_SYMLINK", "FNM_DIR",
+    # 代理（很多环境靠它联网；POSIX 上大小写都可能出现）
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    # agent CLI 的配置目录（是路径，不是密钥）
+    "CODEX_HOME",
+)
+
+_ENV_PASSTHROUGH_ENV = "CC_BRIDGE_ENV_PASSTHROUGH"
+
+
+def _is_sensitive_env_name(name: str) -> bool:
+    upper = name.upper()
+    return any(pat in upper for pat in _SENSITIVE_ENV_PATTERNS)
+
+
+def _env_passthrough_names() -> set[str]:
+    raw = os.environ.get(_ENV_PASSTHROUGH_ENV, "")
+    return {p.strip() for p in raw.split(os.pathsep) if p.strip()}
+
+
+def build_child_env(extra_env: dict | None = None) -> dict:
+    """构造交给 agent 子进程的环境：allow-list，而非 ``os.environ.copy()`` 全量（P0.1）。
+
+    被调用的 agent 是潜在的"嫌疑人"（可能被仓库内容里的注入带偏）。把父进程整份环境
+    （可能含桌面应用注入的 API key / token）原样交给它，等于把验票章一起递过去。这里改为：
+
+    - 只透传 :data:`_BASE_ENV_ALLOW` 里"启动/联网必需"的变量，外加用户经
+      ``CC_BRIDGE_ENV_PASSTHROUGH`` 显式追加的名字；
+    - 无论是否在白名单或 passthrough，命中敏感模式（KEY/TOKEN/SECRET/...）的一律剔除；
+    - ``extra_env`` 是调用方（桥自身）显式、可信的追加，最后覆盖、且不受敏感剔除约束
+      （未来的链路 depth/chain 令牌走这条）。
+
+    注意：这是 allow-list，太严会让子进程起不来。白名单偏宽；真实启动验证属集成测试范畴，
+    缺变量时用 ``CC_BRIDGE_ENV_PASSTHROUGH`` 补即可。
+    """
+    allow = set(_BASE_ENV_ALLOW) | _env_passthrough_names()
+    allow_cmp = {n.upper() for n in allow} if IS_WINDOWS else allow
+
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        key = name.upper() if IS_WINDOWS else name
+        if key not in allow_cmp:
+            continue
+        if _is_sensitive_env_name(name):
+            continue
+        env[name] = value
+
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+# ---------------------------------------------------------------------------
 # 硬化的短命令执行（在 MCP server 里跑 git / --version 等辅助命令的安全姿势）
 # ---------------------------------------------------------------------------
 

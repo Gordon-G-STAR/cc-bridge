@@ -278,9 +278,8 @@ async def _run(
 
     超时时终止进程树，但仍返回已经读到的部分输出。
     """
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
+    # P0.1：用 allow-list 构造子进程环境，不把父进程整份环境（可能含密钥）泄给 agent。
+    env = config.build_child_env(extra_env)
 
     proc = await asyncio.create_subprocess_exec(
         *argv,
