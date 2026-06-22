@@ -9,7 +9,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from cc_bridge.bridge.parser import ParsedResult, ResultParser
+
+
+def _saved_output_path(text: str) -> Path:
+    prefix = "完整输出已保存到:"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return Path(line.removeprefix(prefix))
+    raise AssertionError("missing saved output path")
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +170,57 @@ def test_summarize_truncates_long_summary(make_execution_result):
 
     text = parser.summarize_for_caller(parsed, "claude", max_length=500)
 
-    assert len(text) <= 500
+    saved_path = _saved_output_path(text)
+    assert len(text) <= 500 + len(str(saved_path)) + 64
     # 截断标记应出现
     assert "省略" in text
+
+
+def test_summarize_saves_full_output_when_truncated(make_execution_result):
+    huge = "full-output-line\n" * 1000
+    result = make_execution_result(success=True, output=huge)
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(parsed, "codex", max_length=500)
+
+    assert "省略" in text
+    saved_path = _saved_output_path(text)
+    assert len(text) <= 500 + len(str(saved_path)) + 64
+    assert saved_path.read_text(encoding="utf-8") == huge.strip()
+
+
+def test_summarize_keeps_complete_saved_output_path_after_truncation(
+    monkeypatch, make_execution_result, tmp_path
+):
+    huge = "full-output-line\n" * 1000
+    result = make_execution_result(success=True, output=huge)
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+    saved_path = tmp_path / f"complete-output-path-{'x' * 80}.txt"
+    monkeypatch.setattr(parser, "_save_full_output", lambda _text: str(saved_path))
+
+    text = parser.summarize_for_caller(parsed, "codex", max_length=40)
+
+    assert str(saved_path) in text
+    assert text.rstrip().endswith(str(saved_path))
+    assert len(text) > 40
+
+
+def test_summarize_still_returns_when_saving_full_output_fails(
+    monkeypatch, make_execution_result
+):
+    huge = "full-output-line\n" * 1000
+    result = make_execution_result(success=True, output=huge)
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+    monkeypatch.setattr(parser, "_save_full_output", lambda _text: None)
+
+    text = parser.summarize_for_caller(parsed, "codex", max_length=500)
+
+    assert len(text) <= 500
+    assert "省略" in text
+    assert "完整输出已保存到:" not in text
 
 
 def test_summarize_short_summary_not_truncated(make_execution_result):
@@ -173,6 +231,7 @@ def test_summarize_short_summary_not_truncated(make_execution_result):
     text = parser.summarize_for_caller(parsed, "claude", max_length=4000)
 
     assert "省略" not in text
+    assert "完整输出已保存到:" not in text
     assert "短短的输出" in text
 
 

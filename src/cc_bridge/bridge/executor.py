@@ -30,6 +30,30 @@ ProgressChunkHandler = Callable[[str], None]
 _PROGRESS_QUEUE_MAXSIZE = 64
 _PROGRESS_SEND_TIMEOUT_SECONDS = 0.25
 _PROGRESS_STOP = object()
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.5
+_TRANSIENT_RETRY_HINTS = (
+    "rate limit",
+    "rate_limit",
+    "overloaded",
+    "too many requests",
+    "429",
+    "connection reset",
+    "econnreset",
+    "tls",
+    "handshake",
+    "temporarily",
+)
+_AUTH_FAILURE_HINTS = (
+    "not logged in",
+    "unauthorized",
+    "authentication",
+    "401",
+    "credentials",
+    "please log in",
+    "未登录",
+    "请登录",
+    "登录已过期",
+)
 
 
 @dataclass
@@ -652,6 +676,28 @@ def _extract_claude_session_id(stdout_json: str) -> str | None:
     return session_id
 
 
+def _has_any_hint(text: str, hints: tuple[str, ...]) -> bool:
+    haystack = text.lower()
+    return any(hint in haystack for hint in hints)
+
+
+def _should_retry_transient_failure(
+    *,
+    success: bool,
+    timed_out: bool,
+    stdout: str,
+    stderr: str,
+    output: str,
+    error: str | None,
+) -> bool:
+    if success or timed_out:
+        return False
+    haystack = f"{stderr}\n{stdout}\n{output}\n{error or ''}"
+    if _has_any_hint(haystack, _AUTH_FAILURE_HINTS):
+        return False
+    return _has_any_hint(haystack, _TRANSIENT_RETRY_HINTS)
+
+
 # ---------------------------------------------------------------------------
 # 执行器
 # ---------------------------------------------------------------------------
@@ -786,63 +832,116 @@ class AgentExecutor:
         # git 快照用阻塞 subprocess，放到线程池跑，避免占住事件循环、拖慢取消投递。
         before = await asyncio.to_thread(_git_status, cwd)
         start = time.monotonic()
-        stdout_progress: ProgressCallback | None = None
-        if agent == "codex" and on_progress is not None:
-            stdout_progress = _jsonl_progress_callback(on_progress, _codex_progress_label)
-        elif agent == "claude" and on_progress is not None:
-            stdout_progress = _jsonl_progress_callback(on_progress, _claude_progress_label)
+        def _interpret_result(
+            stdout: str,
+            stderr: str,
+            code: int | None,
+            timed_out: bool,
+        ) -> tuple[str, dict | None, bool, str | None, str | None]:
+            claude_session_id = None
+            if agent == "claude":
+                try:
+                    text, usage, is_error, claude_session_id = _extract_claude(stdout)
+                except Exception:
+                    # 解析意外失败绝不能把一次成功调用判为失败：退回原始输出。
+                    text, usage, is_error = stdout.strip(), None, False
+                success = (code == 0) and not timed_out and not is_error
+            else:
+                final_message = ""
+                if final_file:
+                    try:
+                        final_message = Path(final_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        final_message = ""
+                text, usage = _extract_codex(final_message, stdout)
+                if not text:
+                    text = stdout.strip()
+                success = (code == 0) and not timed_out
 
-        try:
-            stdout, stderr, code, timed_out = await _run(
-                argv,
-                cwd=cwd,
-                stdin_text=prompt,
-                timeout=timeout,
-                on_stdout_chunk=stdout_progress,
+            session_id = None
+            if agent == "codex":
+                session_id = _extract_codex_session_id(stdout) or session_id_hint
+            elif agent == "claude":
+                session_id = (
+                    claude_session_id
+                    or _extract_claude_session_id(stdout)
+                    or session_id_hint
+                )
+
+            error = None
+            if timed_out:
+                error = f"{agent} 调用超时（{timeout}s），返回的是已产生的部分结果。"
+            elif not success:
+                error = (stderr.strip() or f"{agent} 以非零状态码 {code} 退出。")
+            return text, usage, success, session_id, error
+
+        stdout = ""
+        stderr = ""
+        text = ""
+        usage: dict | None = None
+        session_id = None
+        code: int | None = None
+        timed_out = False
+        success = False
+        error: str | None = None
+
+        for attempt in range(2):
+            stdout_progress: ProgressCallback | None = None
+            if agent == "codex" and on_progress is not None:
+                stdout_progress = _jsonl_progress_callback(
+                    on_progress, _codex_progress_label
+                )
+            elif agent == "claude" and on_progress is not None:
+                stdout_progress = _jsonl_progress_callback(
+                    on_progress, _claude_progress_label
+                )
+
+            if final_file:
+                try:
+                    Path(final_file).write_text("", encoding="utf-8")
+                except OSError:
+                    pass
+            try:
+                stdout, stderr, code, timed_out = await _run(
+                    argv,
+                    cwd=cwd,
+                    stdin_text=prompt,
+                    timeout=timeout,
+                    on_stdout_chunk=stdout_progress,
+                )
+            except FileNotFoundError:
+                return _unavailable(agent)
+            except OSError as exc:
+                return ExecutionResult(
+                    success=False,
+                    output="",
+                    error=f"启动 {agent} 失败：{exc}",
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            text, usage, success, session_id, error = _interpret_result(
+                stdout, stderr, code, timed_out
             )
-        except FileNotFoundError:
-            return _unavailable(agent)
-        except OSError as exc:
-            return ExecutionResult(
-                success=False,
-                output="",
-                error=f"启动 {agent} 失败：{exc}",
-                duration_seconds=time.monotonic() - start,
-            )
+            if attempt == 0 and _should_retry_transient_failure(
+                success=success,
+                timed_out=timed_out,
+                stdout=stdout,
+                stderr=stderr,
+                output=text,
+                error=error,
+            ):
+                mid = await asyncio.to_thread(_git_status, cwd)
+                if _diff_git(before, mid):
+                    break
+                await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SECONDS)
+                continue
+            break
+
         duration = time.monotonic() - start
         after = await asyncio.to_thread(_git_status, cwd)
         files_changed = _diff_git(before, after)
-
-        claude_session_id = None
-        if agent == "claude":
-            try:
-                text, usage, is_error, claude_session_id = _extract_claude(stdout)
-            except Exception:
-                # 解析意外失败绝不能把一次成功调用判为失败：退回原始输出。
-                text, usage, is_error = stdout.strip(), None, False
-            success = (code == 0) and not timed_out and not is_error
-        else:
-            final_message = ""
-            if final_file:
-                try:
-                    final_message = Path(final_file).read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    final_message = ""
-            text, usage = _extract_codex(final_message, stdout)
-            if not text:
-                text = stdout.strip()
-            success = (code == 0) and not timed_out
-        session_id = None
-        if agent == "codex":
-            session_id = _extract_codex_session_id(stdout) or session_id_hint
-        elif agent == "claude":
-            session_id = claude_session_id or _extract_claude_session_id(stdout) or session_id_hint
-
-        error = None
-        if timed_out:
-            error = f"{agent} 调用超时（{timeout}s），返回的是已产生的部分结果。"
-        elif not success:
-            error = (stderr.strip() or f"{agent} 以非零状态码 {code} 退出。")
 
         return ExecutionResult(
             success=success,

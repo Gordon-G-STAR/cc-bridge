@@ -35,6 +35,29 @@ def _install_fake_run(monkeypatch, fake):
     monkeypatch.setattr(ex, "_run", fake)
 
 
+class _SequencedRun:
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def __call__(
+        self, argv, *, cwd, stdin_text, timeout, extra_env=None, on_stdout_chunk=None
+    ):
+        self.calls.append(
+            dict(
+                argv=argv,
+                cwd=cwd,
+                stdin_text=stdin_text,
+                timeout=timeout,
+                extra_env=extra_env,
+                on_stdout_chunk=on_stdout_chunk,
+            )
+        )
+        if not self._responses:
+            raise AssertionError("_run called more times than expected")
+        return self._responses.pop(0)
+
+
 # ---------------------------------------------------------------------------
 # Claude：JSON 输出解析
 # ---------------------------------------------------------------------------
@@ -235,6 +258,137 @@ async def test_run_claude_nonzero_exit_uses_stderr_as_error(
 
 
 # ---------------------------------------------------------------------------
+# 瞬时错误自动重试
+# ---------------------------------------------------------------------------
+
+async def test_run_claude_retries_once_on_transient_error_then_success(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    payload = json.dumps({"result": "retry ok", "is_error": False})
+    fake = _SequencedRun(
+        ("", "Error: rate limit exceeded", 1, False),
+        (payload, "", 0, False),
+    )
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.success is True
+    assert result.output == "retry ok"
+    assert len(fake.calls) == 2
+
+
+async def test_run_codex_retries_once_on_transient_error_then_success(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    fake = _SequencedRun(
+        ("", "Error: 429 too many requests", 1, False),
+        ("codex retry ok", "", 0, False),
+    )
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_codex("x", str(tmp_path))
+
+    assert result.success is True
+    assert result.output == "codex retry ok"
+    assert len(fake.calls) == 2
+
+
+async def test_run_claude_transient_error_with_mid_attempt_changes_does_not_retry(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    snapshots = iter([{}, {"changed.py": " M"}, {"changed.py": " M"}])
+    monkeypatch.setattr(ex, "_git_status", lambda cwd: next(snapshots))
+    fake = _SequencedRun(("", "Error: rate limit exceeded", 1, False))
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.success is False
+    assert result.error == "Error: rate limit exceeded"
+    assert result.files_changed == ["changed.py"]
+    assert len(fake.calls) == 1
+
+
+async def test_run_claude_transient_error_without_mid_attempt_changes_retries(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    snapshots = iter([{}, {}, {}])
+    monkeypatch.setattr(ex, "_git_status", lambda cwd: next(snapshots))
+    payload = json.dumps({"result": "retry ok", "is_error": False})
+    fake = _SequencedRun(
+        ("", "Error: rate limit exceeded", 1, False),
+        (payload, "", 0, False),
+    )
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.success is True
+    assert result.output == "retry ok"
+    assert result.files_changed == []
+    assert len(fake.calls) == 2
+
+
+async def test_run_claude_does_not_retry_regular_nonzero_exit(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    fake = _SequencedRun(("", "syntax error", 2, False))
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.success is False
+    assert result.error == "syntax error"
+    assert len(fake.calls) == 1
+
+
+async def test_run_claude_does_not_retry_auth_failure(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    fake = _SequencedRun(("", "401 unauthorized: temporarily unavailable", 1, False))
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
+
+    assert result.success is False
+    assert result.error == "401 unauthorized: temporarily unavailable"
+    assert len(fake.calls) == 1
+
+
+async def test_run_claude_does_not_retry_timeout(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    fake = _SequencedRun(("partial", "rate limit after timeout", None, True))
+    _install_fake_run(monkeypatch, fake)
+
+    result = await ex.AgentExecutor().run_claude("x", str(tmp_path), timeout=5)
+
+    assert result.success is False
+    assert result.timed_out is True
+    assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # argv 契约：codex exec / claude -p，prompt 走 stdin，无过时 flag
 # ---------------------------------------------------------------------------
 
@@ -369,6 +523,42 @@ async def test_run_codex_reports_progress_from_jsonl_chunks(monkeypatch, tmp_pat
 
     assert any("pytest -q" in label for label in labels)
     assert any("测试通过" in label for label in labels)
+
+
+async def test_run_codex_recreates_progress_parser_between_retry_attempts(
+    monkeypatch, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    monkeypatch.setattr(ex, "_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    labels: list[str] = []
+    calls = 0
+
+    async def fake_run(argv, *, cwd, stdin_text, timeout, extra_env=None, on_stdout_chunk=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if on_stdout_chunk is not None:
+                await on_stdout_chunk('{"type":"agent_message","text":"stale"')
+            return "", "Error: 429 too many requests", 1, False
+
+        event = json.dumps({"type": "agent_message", "text": "fresh progress"}) + "\n"
+        if on_stdout_chunk is not None:
+            await on_stdout_chunk(event)
+        return event, "", 0, False
+
+    monkeypatch.setattr(ex, "_run", fake_run)
+
+    async def on_progress(message: str) -> None:
+        labels.append(message)
+
+    result = await ex.AgentExecutor().run_codex(
+        "x", str(tmp_path), on_progress=on_progress
+    )
+
+    assert result.success is True
+    assert calls == 2
+    assert any("fresh progress" in label for label in labels)
 
 
 async def test_pump_progress_dispatcher_slow_callback_does_not_block_stdout():
