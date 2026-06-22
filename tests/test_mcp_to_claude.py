@@ -258,6 +258,36 @@ async def test_claude_analyze_ctx_is_injected_not_input_schema():
     assert "ctx" not in claude_tool.inputSchema.get("properties", {})
 
 
+@pytest.fixture(autouse=True)
+def clear_audit_log_env(monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_AUDIT_LOG", raising=False)
+
+
+async def test_claude_analyze_writes_audit_log_when_enabled(monkeypatch, tmp_path):
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("CC_BRIDGE_AUDIT_LOG", str(log_path))
+    _patch_run_claude(
+        monkeypatch,
+        result=ExecutionResult(
+            success=False,
+            output="nope",
+            files_changed=["docs/review.md"],
+            duration_seconds=1.0,
+        ),
+    )
+
+    await mcp_to_claude.claude_analyze("audit me", project_dir=str(tmp_path))
+
+    record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["direction"] == "claude"
+    assert record["cwd"] == str(tmp_path.resolve())
+    assert record["task_summary"] == "audit me"
+    assert record["success"] is False
+    assert record["files_changed"] == ["docs/review.md"]
+
+
 async def test_claude_status_login_unknown(monkeypatch):
     monkeypatch.setattr(
         mcp_to_claude, "check_claude",

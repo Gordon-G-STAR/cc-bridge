@@ -178,3 +178,28 @@ def test_allowlist_supports_multiple_roots(tmp_path, monkeypatch):
     r2.mkdir()
     monkeypatch.setenv("CC_BRIDGE_ALLOWED_ROOTS", os.pathsep.join([str(r1), str(r2)]))
     assert require_project_dir(str(r2)) == str(r2)
+
+
+def test_build_task_prompt_injects_key_file_content_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_INJECT_CONTEXT", raising=False)
+    _make_fake_project(tmp_path)
+    builder = ContextBuilder()
+    ctx = builder.build_project_context(str(tmp_path))
+
+    prompt = builder.build_task_prompt("do work", ctx, caller="claude")
+
+    assert "name = 'demo'" in prompt
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", " FALSE ", "No"])
+def test_build_task_prompt_can_disable_key_file_content(tmp_path, monkeypatch, raw):
+    monkeypatch.setenv("CC_BRIDGE_INJECT_CONTEXT", raw)
+    _make_fake_project(tmp_path)
+    builder = ContextBuilder()
+    ctx = builder.build_project_context(str(tmp_path))
+
+    prompt = builder.build_task_prompt("do work", ctx, caller="claude")
+
+    assert "name = 'demo'" not in prompt
+    assert "main.py" in prompt
+    assert ctx.root in prompt

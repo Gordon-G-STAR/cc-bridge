@@ -305,3 +305,33 @@ async def test_codex_execute_ctx_is_injected_not_input_schema():
     tools = await mcp.list_tools()
     codex_tool = next(tool for tool in tools if tool.name == "codex_execute")
     assert "ctx" not in codex_tool.inputSchema.get("properties", {})
+
+
+@pytest.fixture(autouse=True)
+def clear_audit_log_env(monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_AUDIT_LOG", raising=False)
+
+
+async def test_codex_execute_writes_audit_log_when_enabled(monkeypatch, tmp_path):
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("CC_BRIDGE_AUDIT_LOG", str(log_path))
+    _patch_run_codex(
+        monkeypatch,
+        result=ExecutionResult(
+            success=True,
+            output="ok",
+            files_changed=["src/foo.py"],
+            duration_seconds=1.0,
+        ),
+    )
+
+    await mcp_to_codex.codex_execute("audit me", project_dir=str(tmp_path))
+
+    record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["direction"] == "codex"
+    assert record["cwd"] == str(tmp_path.resolve())
+    assert record["task_summary"] == "audit me"
+    assert record["success"] is True
+    assert record["files_changed"] == ["src/foo.py"]

@@ -421,6 +421,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def env_bool(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass
 class BridgeConfig:
     """跨 agent 调用的运行期配置。所有字段都可用环境变量覆盖。"""

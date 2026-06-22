@@ -322,6 +322,24 @@ def test_debug_log_silent_without_env(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_env_bool_uses_default_when_unset(monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_FLAG_TEST", raising=False)
+    assert config.env_bool("CC_BRIDGE_FLAG_TEST", default=True) is True
+    assert config.env_bool("CC_BRIDGE_FLAG_TEST", default=False) is False
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", " FALSE "])
+def test_env_bool_reads_false_values(monkeypatch, raw):
+    monkeypatch.setenv("CC_BRIDGE_FLAG_TEST", raw)
+    assert config.env_bool("CC_BRIDGE_FLAG_TEST", default=True) is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "on", " TRUE "])
+def test_env_bool_reads_true_values(monkeypatch, raw):
+    monkeypatch.setenv("CC_BRIDGE_FLAG_TEST", raw)
+    assert config.env_bool("CC_BRIDGE_FLAG_TEST", default=False) is True
+
+
 def test_debug_log_writes_stderr_when_enabled(monkeypatch, capsys):
     monkeypatch.setenv("CC_BRIDGE_DEBUG", "1")
     config.debug_log("阶段A")

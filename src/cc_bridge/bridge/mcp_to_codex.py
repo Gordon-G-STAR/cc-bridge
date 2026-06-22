@@ -19,6 +19,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import config
+from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .executor import AgentExecutor
 from .parser import ResultParser
@@ -159,6 +160,13 @@ async def codex_execute(
             )
             if result.session_id:
                 _remember_codex_session(cwd, result.session_id)
+        append_audit_record(
+            direction="codex",
+            cwd=cwd,
+            task=task,
+            success=result.success,
+            files_changed=result.files_changed,
+        )
         config.debug_log(f"codex_execute: Codex 返回 success={result.success}")
         parsed = ResultParser().parse(result, "codex")
         return ResultParser().summarize_for_caller(parsed, "codex")

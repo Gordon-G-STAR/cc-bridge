@@ -117,6 +117,7 @@ _LANG_BY_EXT = {
 }
 
 _MAX_KEY_FILE_CHARS = 1500
+_INJECT_CONTEXT_ENV = "CC_BRIDGE_INJECT_CONTEXT"
 
 
 @dataclass
@@ -244,7 +245,7 @@ class ContextBuilder:
             git_line = f"分支 {ctx.git_branch}" + ("，有未提交改动" if ctx.git_dirty else "，工作区干净")
 
         key_files_section = ""
-        if ctx.key_files:
+        if ctx.key_files and config.env_bool(_INJECT_CONTEXT_ENV, default=True):
             blocks = []
             for name, content in ctx.key_files.items():
                 blocks.append(f"--- {name} ---\n{content}")
