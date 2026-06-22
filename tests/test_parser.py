@@ -137,6 +137,21 @@ def test_summarize_renders_session_id(make_execution_result):
     assert "sid-visible" in text
 
 
+def test_summarize_renders_token_usage(make_execution_result):
+    result = make_execution_result(
+        success=True,
+        output="ok",
+        token_usage={"input_tokens": 5, "output_tokens": 3},
+    )
+    parser = ResultParser()
+    parsed = parser.parse(result, "claude")
+    text = parser.summarize_for_caller(parsed, "claude")
+
+    assert "Token 用量" in text
+    assert "input_tokens=5" in text
+    assert "output_tokens=3" in text
+
+
 def test_summarize_truncates_long_summary(make_execution_result):
     huge = "字" * 10000
     result = make_execution_result(success=True, output=huge)

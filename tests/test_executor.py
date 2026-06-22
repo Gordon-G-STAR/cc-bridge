@@ -404,7 +404,7 @@ async def test_pump_progress_dispatcher_slow_callback_does_not_block_stdout():
     assert time.monotonic() - start < 1.0
 
 
-async def test_run_claude_argv_uses_print_json(
+async def test_run_claude_argv_uses_print_stream_json(
     monkeypatch, fake_run_factory, tmp_path
 ):
     _patch_cli_available(monkeypatch)
@@ -417,7 +417,8 @@ async def test_run_claude_argv_uses_print_json(
     argv = fake.calls[0]["argv"]
 
     assert "-p" in argv
-    assert "--output-format" in argv and "json" in argv
+    assert "--output-format" in argv and "stream-json" in argv
+    assert "--verbose" in argv
     assert "--permission-mode" in argv
     assert "--model" in argv and "opus" in argv
     for bad in ("-q", "exec", "--full-auto"):
@@ -439,7 +440,8 @@ async def test_run_claude_resume_argv_uses_session_and_stdin(
     argv = fake.calls[0]["argv"]
 
     assert "-p" in argv
-    assert "--output-format" in argv and "json" in argv
+    assert "--output-format" in argv and "stream-json" in argv
+    assert "--verbose" in argv
     assert "--permission-mode" in argv
     assert "--resume" in argv and "sid-claude" in argv
     assert "--model" in argv and "opus" in argv
@@ -459,6 +461,60 @@ async def test_run_claude_captures_session_id_from_json(
     result = await ex.AgentExecutor().run_claude("x", str(tmp_path))
 
     assert result.session_id == "sid-json"
+
+
+async def test_run_claude_reports_progress_from_stream_json_chunks(monkeypatch, tmp_path):
+    """stdout 分块到达时，Claude stream-json 也应增量回调可读进度。"""
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    events = [
+        json.dumps({"type": "system", "subtype": "init"}) + "\n",
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "pytest -q"},
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n",
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "正在检查结果"}]},
+            }
+        )
+        + "\n",
+        json.dumps({"type": "result", "result": "done", "is_error": False}) + "\n",
+    ]
+    labels: list[str] = []
+
+    async def fake_run(argv, *, cwd, stdin_text, timeout, extra_env=None, on_stdout_chunk=None):
+        stdout = ""
+        for event in events:
+            stdout += event
+            if on_stdout_chunk is not None:
+                await on_stdout_chunk(event)
+        return stdout, "", 0, False
+
+    monkeypatch.setattr(ex, "_run", fake_run)
+
+    async def on_progress(message: str) -> None:
+        labels.append(message)
+
+    result = await ex.AgentExecutor().run_claude(
+        "x", str(tmp_path), on_progress=on_progress
+    )
+
+    assert result.output == "done"
+    assert any("pytest -q" in label for label in labels)
+    assert any("正在检查结果" in label for label in labels)
 
 
 # ---------------------------------------------------------------------------
@@ -535,18 +591,70 @@ def test_git_status_parses_z_format(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_extract_claude_non_dict_usage_no_crash():
-    text, usage, is_error = ex._extract_claude(
+    text, usage, is_error, session_id = ex._extract_claude(
         json.dumps({"result": "hi", "usage": 5, "total_cost_usd": 0.01})
     )
     assert text == "hi"
     assert usage == {"total_cost_usd": 0.01}  # 非 dict 的 usage 被丢弃，仅保留成本
     assert is_error is False
+    assert session_id is None
 
 
 def test_extract_claude_string_usage_no_crash():
-    text, usage, _ = ex._extract_claude(json.dumps({"result": "x", "usage": "abc"}))
+    text, usage, _, session_id = ex._extract_claude(
+        json.dumps({"result": "x", "usage": "abc"})
+    )
     assert text == "x"
     assert usage is None
+    assert session_id is None
+
+
+def test_extract_claude_single_json_remains_supported():
+    text, usage, is_error, session_id = ex._extract_claude(
+        json.dumps(
+            {
+                "result": "legacy result",
+                "usage": {"input_tokens": 2},
+                "is_error": False,
+                "session_id": "sid-legacy",
+            }
+        )
+    )
+
+    assert text == "legacy result"
+    assert usage == {"input_tokens": 2}
+    assert is_error is False
+    assert session_id == "sid-legacy"
+
+
+def test_extract_claude_stream_json_uses_result_event():
+    jsonl = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sid-init"}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "not final"}]},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "final answer",
+                    "usage": {"input_tokens": 11, "output_tokens": 7},
+                    "is_error": False,
+                    "session_id": "sid-result",
+                }
+            ),
+        ]
+    )
+
+    text, usage, is_error, session_id = ex._extract_claude(jsonl)
+
+    assert text == "final answer"
+    assert usage == {"input_tokens": 11, "output_tokens": 7}
+    assert is_error is False
+    assert session_id == "sid-result"
 
 
 # ---------------------------------------------------------------------------

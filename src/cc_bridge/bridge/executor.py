@@ -372,27 +372,53 @@ def _diff_git(before: dict[str, str] | None, after: dict[str, str] | None) -> li
 # 输出的最小提取（语义解析交给 parser.py）
 # ---------------------------------------------------------------------------
 
-def _extract_claude(stdout: str) -> tuple[str, dict | None, bool]:
-    """从 ``claude --output-format json`` 的输出里取出 (text, usage, is_error)。"""
+def _extract_claude_event(data: dict) -> tuple[str, dict | None, bool, str | None]:
+    text = data.get("result") or data.get("text") or ""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = None  # usage 可能是非 dict（脏数据）；不臆断其形状
+    if data.get("total_cost_usd") is not None:
+        # 解包前确保是 mapping，否则 {**非mapping} 会抛 TypeError，
+        # 把一次【实际成功】的调用误判成失败、丢掉真实输出。
+        usage = {**(usage or {}), "total_cost_usd": data["total_cost_usd"]}
+    is_error = bool(data.get("is_error"))
+    session_id = _find_codex_session_id(data)
+    return (text if isinstance(text, str) else json.dumps(text)), usage, is_error, session_id
+
+
+def _extract_claude(stdout: str) -> tuple[str, dict | None, bool, str | None]:
+    """从 Claude 单 JSON 或 stream-json(JSONL) 输出里取出结果。"""
     stdout = stdout.strip()
     if not stdout:
-        return "", None, False
+        return "", None, False, None
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
-        return stdout, None, False
+        data = None
     if isinstance(data, dict):
-        text = data.get("result") or data.get("text") or ""
-        usage = data.get("usage")
-        if not isinstance(usage, dict):
-            usage = None  # usage 可能是非 dict（脏数据）；不臆断其形状
-        if data.get("total_cost_usd") is not None:
-            # 解包前确保是 mapping，否则 {**非mapping} 会抛 TypeError，
-            # 把一次【实际成功】的调用误判成失败、丢掉真实输出。
-            usage = {**(usage or {}), "total_cost_usd": data["total_cost_usd"]}
-        is_error = bool(data.get("is_error"))
-        return (text if isinstance(text, str) else json.dumps(text)), usage, is_error
-    return stdout, None, False
+        return _extract_claude_event(data)
+
+    result_event: dict | None = None
+    stream_session_id: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if stream_session_id is None:
+            stream_session_id = _find_codex_session_id(event)
+        if event.get("type") == "result":
+            result_event = event
+
+    if result_event is not None:
+        text, usage, is_error, session_id = _extract_claude_event(result_event)
+        return text, usage, is_error, session_id or stream_session_id
+    return stdout, None, False, stream_session_id
 
 
 def _extract_codex(final_message: str, stdout_jsonl: str) -> tuple[str, dict | None]:
@@ -446,6 +472,11 @@ def _short_progress(text: str, limit: int = 240) -> str:
 def _string_value(value) -> str | None:
     if isinstance(value, str):
         return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "result"):
+            nested = _string_value(value.get(key))
+            if nested:
+                return nested
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
@@ -500,6 +531,78 @@ def _codex_progress_label(event: dict) -> str | None:
     return None
 
 
+def _claude_tool_progress_label(event: dict) -> str | None:
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    content = message.get("content") or event.get("content")
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return None
+
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        tool_name = _string_value(item.get("name")) or "tool"
+        tool_input = item.get("input") if isinstance(item.get("input"), dict) else {}
+        command = _event_command(tool_input) or _event_command(item)
+        if command:
+            return f"Claude 正在执行: {_short_progress(command)}"
+        return f"Claude 正在使用工具: {_short_progress(tool_name)}"
+    return None
+
+
+def _claude_progress_label(event: dict) -> str | None:
+    """把 Claude stream-json 事件压缩成人类可读的一行进度标签。"""
+    event_type = str(event.get("type") or "")
+    subtype = str(event.get("subtype") or "")
+
+    if event_type == "result":
+        if event.get("is_error"):
+            return "Claude 返回错误"
+        return "Claude 已完成处理"
+
+    tool_label = _claude_tool_progress_label(event)
+    if tool_label:
+        return tool_label
+
+    text = _event_text(event)
+    if text and (event_type == "assistant" or "message" in event_type):
+        return f"Claude: {_short_progress(text)}"
+
+    if event_type == "system" and subtype == "init":
+        return "Claude 已开始处理"
+    return None
+
+
+def _jsonl_progress_callback(
+    on_progress: ProgressCallback,
+    labeler: Callable[[dict], str | None],
+) -> ProgressCallback:
+    line_buffer = ""
+
+    async def _on_stdout(chunk: str) -> None:
+        nonlocal line_buffer
+        line_buffer += chunk
+        while "\n" in line_buffer:
+            line, line_buffer = line_buffer.split("\n", 1)
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            try:
+                label = labeler(event)
+            except Exception:
+                continue
+            await _safe_progress(on_progress, label or "")
+
+    return _on_stdout
+
+
 def _find_codex_session_id(data: dict) -> str | None:
     for key in _SESSION_ID_KEYS:
         value = data.get(key)
@@ -541,17 +644,12 @@ def _extract_codex_session_id(stdout_jsonl: str) -> str | None:
 
 
 def _extract_claude_session_id(stdout_json: str) -> str | None:
-    """从 ``claude -p --output-format json`` 的单 JSON 输出里提取 session id。"""
-    stdout_json = stdout_json.strip()
-    if not stdout_json:
-        return None
+    """从 Claude 单 JSON 或 stream-json(JSONL) 输出里提取 session id。"""
     try:
-        data = json.loads(stdout_json)
-    except json.JSONDecodeError:
+        _text, _usage, _is_error, session_id = _extract_claude(stdout_json)
+    except Exception:
         return None
-    if not isinstance(data, dict):
-        return None
-    return _find_codex_session_id(data)
+    return session_id
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +675,14 @@ class AgentExecutor:
         if not exe:
             return _unavailable("claude")
 
-        args = ["-p", "--output-format", "json", "--permission-mode", self.cfg.claude_permission_mode]
+        args = [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            self.cfg.claude_permission_mode,
+        ]
         if self.cfg.claude_model:
             args += ["--model", self.cfg.claude_model]
         if resume_session_id:
@@ -683,27 +788,9 @@ class AgentExecutor:
         start = time.monotonic()
         stdout_progress: ProgressCallback | None = None
         if agent == "codex" and on_progress is not None:
-            line_buffer = ""
-
-            async def _on_codex_stdout(chunk: str) -> None:
-                nonlocal line_buffer
-                line_buffer += chunk
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line or not line.startswith("{"):
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    await _safe_progress(on_progress, _codex_progress_label(event) or "")
-
-            stdout_progress = _on_codex_stdout
-        elif agent == "claude":
-            await _safe_progress(on_progress, "Claude 已开始处理")
+            stdout_progress = _jsonl_progress_callback(on_progress, _codex_progress_label)
+        elif agent == "claude" and on_progress is not None:
+            stdout_progress = _jsonl_progress_callback(on_progress, _claude_progress_label)
 
         try:
             stdout, stderr, code, timed_out = await _run(
@@ -726,9 +813,10 @@ class AgentExecutor:
         after = await asyncio.to_thread(_git_status, cwd)
         files_changed = _diff_git(before, after)
 
+        claude_session_id = None
         if agent == "claude":
             try:
-                text, usage, is_error = _extract_claude(stdout)
+                text, usage, is_error, claude_session_id = _extract_claude(stdout)
             except Exception:
                 # 解析意外失败绝不能把一次成功调用判为失败：退回原始输出。
                 text, usage, is_error = stdout.strip(), None, False
@@ -748,7 +836,7 @@ class AgentExecutor:
         if agent == "codex":
             session_id = _extract_codex_session_id(stdout) or session_id_hint
         elif agent == "claude":
-            session_id = _extract_claude_session_id(stdout) or session_id_hint
+            session_id = claude_session_id or _extract_claude_session_id(stdout) or session_id_hint
 
         error = None
         if timed_out:

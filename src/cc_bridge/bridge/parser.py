@@ -109,6 +109,10 @@ class ResultParser:
             lines.append("")
             lines.append(f"{agent_name} 会话 ID：{parsed.session_id}")
 
+        if parsed.token_usage:
+            lines.append("")
+            lines.append(f"Token 用量：{self._format_token_usage(parsed.token_usage)}")
+
         if parsed.summary:
             lines.append("")
             lines.append(f"{agent_name} 的说明：")
@@ -120,6 +124,30 @@ class ResultParser:
 
         text = "\n".join(lines)
         return self._truncate(text, max_length)
+
+    @staticmethod
+    def _format_token_usage(token_usage: dict) -> str:
+        preferred = (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "total_tokens",
+            "total_cost_usd",
+        )
+        parts: list[str] = []
+        seen: set[str] = set()
+        for key in preferred:
+            if key in token_usage:
+                parts.append(f"{key}={token_usage[key]}")
+                seen.add(key)
+        for key in sorted(token_usage):
+            if key in seen:
+                continue
+            parts.append(f"{key}={token_usage[key]}")
+            if len(parts) >= 8:
+                break
+        return ", ".join(parts) if parts else str(token_usage)
 
     def _failure_hint(self, agent_name: str, kind: str | None) -> str | None:
         if kind == "quota":
