@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config
+from . import agents, config
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 ProgressChunkHandler = Callable[[str], None]
@@ -393,209 +393,47 @@ def _diff_git(before: dict[str, str] | None, after: dict[str, str] | None) -> li
 
 
 # ---------------------------------------------------------------------------
-# 输出的最小提取（语义解析交给 parser.py）
+# Agent adapter compatibility wrappers
 # ---------------------------------------------------------------------------
 
 def _extract_claude_event(data: dict) -> tuple[str, dict | None, bool, str | None]:
-    text = data.get("result") or data.get("text") or ""
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        usage = None  # usage 可能是非 dict（脏数据）；不臆断其形状
-    if data.get("total_cost_usd") is not None:
-        # 解包前确保是 mapping，否则 {**非mapping} 会抛 TypeError，
-        # 把一次【实际成功】的调用误判成失败、丢掉真实输出。
-        usage = {**(usage or {}), "total_cost_usd": data["total_cost_usd"]}
-    is_error = bool(data.get("is_error"))
-    session_id = _find_codex_session_id(data)
-    return (text if isinstance(text, str) else json.dumps(text)), usage, is_error, session_id
+    return agents._extract_claude_event(data)
 
 
 def _extract_claude(stdout: str) -> tuple[str, dict | None, bool, str | None]:
-    """从 Claude 单 JSON 或 stream-json(JSONL) 输出里取出结果。"""
-    stdout = stdout.strip()
-    if not stdout:
-        return "", None, False, None
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        return _extract_claude_event(data)
-
-    result_event: dict | None = None
-    stream_session_id: str | None = None
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if stream_session_id is None:
-            stream_session_id = _find_codex_session_id(event)
-        if event.get("type") == "result":
-            result_event = event
-
-    if result_event is not None:
-        text, usage, is_error, session_id = _extract_claude_event(result_event)
-        return text, usage, is_error, session_id or stream_session_id
-    return stdout, None, False, stream_session_id
+    return agents.get_agent("claude").extract(stdout, None)
 
 
 def _extract_codex(final_message: str, stdout_jsonl: str) -> tuple[str, dict | None]:
-    """优先用 ``-o`` 写出的最终消息；usage 尽力从 JSONL 事件里捞。"""
-    text = final_message.strip()
-    usage: dict | None = None
-    for line in stdout_jsonl.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        # 不同 codex 版本字段名不同，宽松匹配 token 用量。
-        for key in ("usage", "token_usage", "tokens"):
-            if isinstance(event.get(key), dict):
-                usage = event[key]
-        # 没有 -o 文件时，从事件里兜底提取最终助手消息。
-        if not text:
-            item = event.get("item") if isinstance(event.get("item"), dict) else None
-            candidate = None
-            if item and item.get("type") in {"agent_message", "assistant_message", "message"}:
-                candidate = item.get("text") or item.get("content")
-            elif event.get("type") in {"agent_message", "assistant_message"}:
-                candidate = event.get("text") or event.get("message")
-            if isinstance(candidate, str) and candidate.strip():
-                text = candidate.strip()
-    return text, usage
-
-
-_SESSION_ID_KEYS = (
-    "session_id",
-    "sessionId",
-    "conversation_id",
-    "conversationId",
-    "thread_id",
-    "threadId",
-)
+    return agents._extract_codex(final_message, stdout_jsonl)
 
 
 def _short_progress(text: str, limit: int = 240) -> str:
-    text = " ".join(str(text).split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+    return agents._short_progress(text, limit)
 
 
 def _string_value(value) -> str | None:
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, dict):
-        for key in ("text", "content", "message", "result"):
-            nested = _string_value(value.get(key))
-            if nested:
-                return nested
-    if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                nested = _string_value(item.get("text") or item.get("content"))
-                if nested:
-                    parts.append(nested)
-        return " ".join(parts).strip() or None
-    return None
+    return agents._string_value(value)
 
 
 def _event_text(data: dict) -> str | None:
-    for key in ("text", "message", "content", "result"):
-        value = _string_value(data.get(key))
-        if value:
-            return value
-    return None
+    return agents._event_text(data)
 
 
 def _event_command(data: dict) -> str | None:
-    for key in ("command", "cmd", "shell_command"):
-        value = _string_value(data.get(key))
-        if value:
-            return value
-    argv = data.get("argv") or data.get("args")
-    if isinstance(argv, list) and all(isinstance(part, str) for part in argv):
-        return " ".join(argv).strip() or None
-    return None
+    return agents._event_command(data)
 
 
 def _codex_progress_label(event: dict) -> str | None:
-    """把 Codex JSONL 事件压缩成人类可读的一行进度标签。"""
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    command = _event_command(item) or _event_command(event)
-    if command:
-        return f"Codex 正在执行: {_short_progress(command)}"
-
-    event_type = str(event.get("type") or "")
-    item_type = str(item.get("type") or "")
-    text = _event_text(item) or _event_text(event)
-    if text and (
-        "message" in event_type
-        or "message" in item_type
-        or item_type in {"agent_message", "assistant_message"}
-    ):
-        return f"Codex: {_short_progress(text)}"
-
-    if event_type in {"turn.started", "task.started", "session.created"}:
-        return "Codex 已开始处理"
-    return None
+    return agents.get_agent("codex").progress_label(event)
 
 
 def _claude_tool_progress_label(event: dict) -> str | None:
-    message = event.get("message") if isinstance(event.get("message"), dict) else {}
-    content = message.get("content") or event.get("content")
-    if isinstance(content, dict):
-        content = [content]
-    if not isinstance(content, list):
-        return None
-
-    for item in content:
-        if not isinstance(item, dict) or item.get("type") != "tool_use":
-            continue
-        tool_name = _string_value(item.get("name")) or "tool"
-        tool_input = item.get("input") if isinstance(item.get("input"), dict) else {}
-        command = _event_command(tool_input) or _event_command(item)
-        if command:
-            return f"Claude 正在执行: {_short_progress(command)}"
-        return f"Claude 正在使用工具: {_short_progress(tool_name)}"
-    return None
+    return agents._claude_tool_progress_label(event)
 
 
 def _claude_progress_label(event: dict) -> str | None:
-    """把 Claude stream-json 事件压缩成人类可读的一行进度标签。"""
-    event_type = str(event.get("type") or "")
-    subtype = str(event.get("subtype") or "")
-
-    if event_type == "result":
-        if event.get("is_error"):
-            return "Claude 返回错误"
-        return "Claude 已完成处理"
-
-    tool_label = _claude_tool_progress_label(event)
-    if tool_label:
-        return tool_label
-
-    text = _event_text(event)
-    if text and (event_type == "assistant" or "message" in event_type):
-        return f"Claude: {_short_progress(text)}"
-
-    if event_type == "system" and subtype == "init":
-        return "Claude 已开始处理"
-    return None
+    return agents.get_agent("claude").progress_label(event)
 
 
 def _jsonl_progress_callback(
@@ -628,43 +466,12 @@ def _jsonl_progress_callback(
 
 
 def _find_codex_session_id(data: dict) -> str | None:
-    for key in _SESSION_ID_KEYS:
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    for container_key in ("session", "conversation", "thread"):
-        nested = data.get(container_key)
-        if not isinstance(nested, dict):
-            continue
-        for key in ("id", *_SESSION_ID_KEYS):
-            value = nested.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    event_type = str(data.get("type") or "")
-    value = data.get("id")
-    if event_type.startswith("session") and isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+    return agents._find_session_id(data)
 
 
 def _extract_codex_session_id(stdout_jsonl: str) -> str | None:
     """从本次 Codex --json 输出中提取会话 ID；找不到时返回 None。"""
-    for line in stdout_jsonl.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        session_id = _find_codex_session_id(event)
-        if session_id:
-            return session_id
-    return None
+    return agents._extract_codex_session_id(stdout_jsonl)
 
 
 def _extract_claude_session_id(stdout_json: str) -> str | None:
@@ -703,10 +510,57 @@ def _should_retry_transient_failure(
 # ---------------------------------------------------------------------------
 
 class AgentExecutor:
-    """管理对 ``claude`` / ``codex`` CLI 的后台调用。"""
+    """管理对任意已注册 CLI agent 的后台调用。"""
 
     def __init__(self, cfg: config.BridgeConfig | None = None) -> None:
         self.cfg = cfg or BridgeConfigFactory()
+
+    async def run_agent(
+        self,
+        agent: agents.Agent | str,
+        prompt: str,
+        cwd: str,
+        timeout: int | None = None,
+        resume_session_id: str | None = None,
+        on_progress: ProgressCallback | None = None,
+        mode_override: str | None = None,
+        model: str | None = None,
+    ) -> ExecutionResult:
+        agent_obj = agents.get_agent(agent) if isinstance(agent, str) else agent
+        exe = config.resolve_cli(agent_obj.cli_name)
+        if not exe:
+            return _unavailable(agent_obj)
+
+        final_file = None
+        if agent_obj.requires_final_file:
+            out_fd, final_file = tempfile.mkstemp(
+                prefix=agent_obj.final_file_prefix, suffix=".txt"
+            )
+            os.close(out_fd)
+        try:
+            args = agent_obj.build_args(
+                mode_override=mode_override,
+                model=model,
+                resume_session_id=resume_session_id,
+                final_file=final_file,
+            )
+            argv = config.build_launch_argv(exe, args)
+            return await self._invoke(
+                agent_obj,
+                argv,
+                prompt,
+                cwd,
+                timeout,
+                final_file=final_file,
+                on_progress=on_progress,
+                session_id_hint=resume_session_id,
+            )
+        finally:
+            if final_file:
+                try:
+                    os.unlink(final_file)
+                except OSError:
+                    pass
 
     # -- Claude -----------------------------------------------------------
     async def run_claude(
@@ -718,36 +572,20 @@ class AgentExecutor:
         on_progress: ProgressCallback | None = None,
         permission_override: str | None = None,
     ) -> ExecutionResult:
-        exe = config.resolve_cli("claude")
-        if not exe:
-            return _unavailable("claude")
-
         permission_mode = (
             permission_override
             if permission_override is not None
             else self.cfg.claude_permission_mode
         )
-        args = [
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            permission_mode,
-        ]
-        if self.cfg.claude_model:
-            args += ["--model", self.cfg.claude_model]
-        if resume_session_id:
-            args += ["--resume", resume_session_id]
-        argv = config.build_launch_argv(exe, args)
-        return await self._invoke(
-            "claude",
-            argv,
+        return await self.run_agent(
+            agents.get_agent("claude"),
             prompt,
             cwd,
             timeout,
+            resume_session_id=resume_session_id,
             on_progress=on_progress,
-            session_id_hint=resume_session_id,
+            mode_override=permission_mode,
+            model=self.cfg.claude_model,
         )
 
     # -- Codex ------------------------------------------------------------
@@ -760,63 +598,24 @@ class AgentExecutor:
         on_progress: ProgressCallback | None = None,
         sandbox_override: str | None = None,
     ) -> ExecutionResult:
-        exe = config.resolve_cli("codex")
-        if not exe:
-            return _unavailable("codex")
-
         sandbox = (
             sandbox_override if sandbox_override is not None else self.cfg.codex_sandbox
         )
-        out_fd, out_path = tempfile.mkstemp(prefix="cc_bridge_codex_", suffix=".txt")
-        os.close(out_fd)
-        if resume_session_id:
-            args = [
-                "exec",
-                "resume",
-                "-c",
-                f"sandbox_mode={sandbox}",
-                resume_session_id,
-                "--skip-git-repo-check",
-                "--json",
-                "-o",
-                out_path,
-            ]
-        else:
-            args = [
-                "exec",
-                "--sandbox",
-                sandbox,
-                "--skip-git-repo-check",
-                "--json",
-                "-o",
-                out_path,
-            ]
-        if self.cfg.codex_model:
-            args += ["-m", self.cfg.codex_model]
-        if resume_session_id:
-            args.append("-")
-        argv = config.build_launch_argv(exe, args)
-        try:
-            return await self._invoke(
-                "codex",
-                argv,
-                prompt,
-                cwd,
-                timeout,
-                final_file=out_path,
-                on_progress=on_progress,
-                session_id_hint=resume_session_id,
-            )
-        finally:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
+        return await self.run_agent(
+            agents.get_agent("codex"),
+            prompt,
+            cwd,
+            timeout,
+            resume_session_id=resume_session_id,
+            on_progress=on_progress,
+            mode_override=sandbox,
+            model=self.cfg.codex_model,
+        )
 
     # -- 共通流程 ---------------------------------------------------------
     async def _invoke(
         self,
-        agent: str,
+        agent: agents.Agent,
         argv: list[str],
         prompt: str,
         cwd: str,
@@ -842,49 +641,26 @@ class AgentExecutor:
         # git 快照用阻塞 subprocess，放到线程池跑，避免占住事件循环、拖慢取消投递。
         before = await asyncio.to_thread(_git_status, cwd)
         start = time.monotonic()
+
         def _interpret_result(
             stdout: str,
             stderr: str,
             code: int | None,
             timed_out: bool,
         ) -> tuple[str, dict | None, bool, str | None, str | None]:
-            claude_session_id = None
-            if agent == "claude":
-                try:
-                    text, usage, is_error, claude_session_id = _extract_claude(stdout)
-                except Exception:
-                    # 解析意外失败绝不能把一次成功调用判为失败：退回原始输出。
-                    text, usage, is_error = stdout.strip(), None, False
-                success = (code == 0) and not timed_out and not is_error
-            else:
-                final_message = ""
-                if final_file:
-                    try:
-                        final_message = Path(final_file).read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                    except OSError:
-                        final_message = ""
-                text, usage = _extract_codex(final_message, stdout)
-                if not text:
-                    text = stdout.strip()
-                success = (code == 0) and not timed_out
-
-            session_id = None
-            if agent == "codex":
-                session_id = _extract_codex_session_id(stdout) or session_id_hint
-            elif agent == "claude":
-                session_id = (
-                    claude_session_id
-                    or _extract_claude_session_id(stdout)
-                    or session_id_hint
-                )
+            try:
+                text, usage, is_error, session_id = agent.extract(stdout, final_file)
+            except Exception:
+                # 解析意外失败绝不能把一次成功调用判为失败：退回原始输出。
+                text, usage, is_error, session_id = stdout.strip(), None, False, None
+            success = (code == 0) and not timed_out and not is_error
+            session_id = session_id or session_id_hint
 
             error = None
             if timed_out:
-                error = f"{agent} 调用超时（{timeout}s），返回的是已产生的部分结果。"
+                error = f"{agent.name} 调用超时（{timeout}s），返回的是已产生的部分结果。"
             elif not success:
-                error = (stderr.strip() or f"{agent} 以非零状态码 {code} 退出。")
+                error = (stderr.strip() or f"{agent.name} 以非零状态码 {code} 退出。")
             return text, usage, success, session_id, error
 
         stdout = ""
@@ -899,13 +675,9 @@ class AgentExecutor:
 
         for attempt in range(2):
             stdout_progress: ProgressCallback | None = None
-            if agent == "codex" and on_progress is not None:
+            if on_progress is not None:
                 stdout_progress = _jsonl_progress_callback(
-                    on_progress, _codex_progress_label
-                )
-            elif agent == "claude" and on_progress is not None:
-                stdout_progress = _jsonl_progress_callback(
-                    on_progress, _claude_progress_label
+                    on_progress, agent.progress_label
                 )
 
             if final_file:
@@ -927,7 +699,7 @@ class AgentExecutor:
                 return ExecutionResult(
                     success=False,
                     output="",
-                    error=f"启动 {agent} 失败：{exc}",
+                    error=f"启动 {agent.name} 失败：{exc}",
                     duration_seconds=time.monotonic() - start,
                 )
 
@@ -968,13 +740,23 @@ class AgentExecutor:
         )
 
 
-def _unavailable(agent: str) -> ExecutionResult:
-    name = "Claude Code CLI" if agent == "claude" else "Codex CLI"
+def _unavailable(agent: agents.Agent | str) -> ExecutionResult:
+    if isinstance(agent, str):
+        agent_obj = agents.AGENTS.get(agent)
+        agent_name = agent
+        display_name = (
+            agent_obj.unavailable_name
+            if agent_obj is not None
+            else f"{agent_name} CLI"
+        )
+    else:
+        agent_name = agent.name
+        display_name = agent.unavailable_name
     return ExecutionResult(
         success=False,
         output="",
         error=(
-            f"未找到 {name}（`{agent}` 命令不可用）。"
+            f"未找到 {display_name}（`{agent_name}` 命令不可用）。"
             f"请先安装并登录对应的桌面版，再运行 cc-bridge 安装向导。"
         ),
         exit_code=None,

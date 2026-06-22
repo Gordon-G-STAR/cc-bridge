@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config
+from .agents import get_agent
 
 
 @dataclass
@@ -77,13 +78,17 @@ def claude_login() -> tuple[bool, bool]:
 
 
 def check_claude() -> AgentReadiness:
-    exe = config.resolve_cli("claude")
+    agent = get_agent("claude")
+    exe = config.resolve_cli(agent.cli_name)
     logged_in, login_known = claude_login()
-    return AgentReadiness("Claude", exe, cli_version("claude", exe), logged_in, login_known)
+    return AgentReadiness(
+        "Claude", exe, cli_version(agent.cli_name, exe), logged_in, login_known
+    )
 
 
 def check_codex() -> AgentReadiness:
     # Codex 登录态可由 ~/.codex/auth.json 可靠判断。
-    exe = config.resolve_cli("codex")
+    agent = get_agent("codex")
+    exe = config.resolve_cli(agent.cli_name)
     logged_in = config.codex_auth_path().exists()
-    return AgentReadiness("Codex", exe, cli_version("codex", exe), logged_in, True)
+    return AgentReadiness("Codex", exe, cli_version(agent.cli_name, exe), logged_in, True)
