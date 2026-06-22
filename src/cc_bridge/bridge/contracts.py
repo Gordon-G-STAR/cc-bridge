@@ -47,6 +47,7 @@ class FailureKind(str, Enum):
     check_failed = "check_failed"
     policy_denied = "policy_denied"
     invalid_contract = "invalid_contract"
+    project_busy = "project_busy"
     partial_rollback = "partial_rollback"
 
 

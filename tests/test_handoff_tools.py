@@ -6,9 +6,11 @@ HandoffResult,fail-closed,绝不向 MCP 抛异常。
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
-from cc_bridge.bridge import mcp_to_claude, mcp_to_codex
+from cc_bridge.bridge import config, mcp_to_claude, mcp_to_codex
 from cc_bridge.bridge.context import ContextBuilder, ProjectContext
 from cc_bridge.bridge.contracts import (
     FailureKind,
@@ -17,6 +19,7 @@ from cc_bridge.bridge.contracts import (
     RequestedScope,
 )
 from cc_bridge.bridge.executor import AgentExecutor, ExecutionResult
+from cc_bridge.bridge.locks import LockBusy
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +40,12 @@ def clear_caches_and_audit(monkeypatch):
         mcp_to_claude._CLAUDE_SESSION_LOCKS_BY_PROJECT,
     ):
         store.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_app_dir(monkeypatch, tmp_path):
+    app_dir = tmp_path / "app"
+    monkeypatch.setattr(config, "stable_app_dir", lambda: app_dir)
 
 
 def _req(writable=None) -> HandoffRequest:
@@ -72,6 +81,28 @@ async def test_codex_handoff_forces_read_only_and_returns_structured(monkeypatch
     assert res.verified_files_changed == []
     assert res.token_usage == {"t": 1}
     assert calls[0]["sandbox_override"] == "read-only"  # 骨架强制只读
+
+
+async def test_codex_handoff_lock_busy_is_project_busy(monkeypatch, tmp_path):
+    @contextlib.asynccontextmanager
+    async def _busy_lock(*_args, **_kwargs):
+        raise LockBusy("busy")
+        yield
+
+    async def _unexpected(self, *args, **kwargs):
+        raise AssertionError("Codex should not run when project lock is busy")
+
+    monkeypatch.setattr(mcp_to_codex, "async_project_lock", _busy_lock)
+    monkeypatch.setattr(AgentExecutor, "run_codex", _unexpected)
+
+    res = await mcp_to_codex.codex_handoff(_req(), project_dir=str(tmp_path))
+
+    assert res.status == "failed"
+    assert res.failure_kind is FailureKind.project_busy
+    assert (
+        res.route_reason
+        == "Another bridge process is handling this project; try again shortly."
+    )
 
 
 async def test_codex_handoff_ignores_requested_writes_but_notes_it(monkeypatch, tmp_path):
@@ -147,6 +178,28 @@ async def test_claude_handoff_forces_plan_mode(monkeypatch, tmp_path):
     assert res.agent_used == "claude"
     assert res.evidence_level == "unknown"
     assert calls[0]["permission_override"] == "plan"   # 骨架强制只读 plan
+
+
+async def test_claude_handoff_lock_busy_is_project_busy(monkeypatch, tmp_path):
+    @contextlib.asynccontextmanager
+    async def _busy_lock(*_args, **_kwargs):
+        raise LockBusy("busy")
+        yield
+
+    async def _unexpected(self, *args, **kwargs):
+        raise AssertionError("Claude should not run when project lock is busy")
+
+    monkeypatch.setattr(mcp_to_claude, "async_project_lock", _busy_lock)
+    monkeypatch.setattr(AgentExecutor, "run_claude", _unexpected)
+
+    res = await mcp_to_claude.claude_handoff(_req(), project_dir=str(tmp_path))
+
+    assert res.status == "failed"
+    assert res.failure_kind is FailureKind.project_busy
+    assert (
+        res.route_reason
+        == "Another bridge process is handling this project; try again shortly."
+    )
 
 
 async def test_claude_handoff_bad_project_dir_is_fail_closed(monkeypatch):

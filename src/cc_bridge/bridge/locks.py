@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import os
@@ -110,4 +111,20 @@ def project_lock(
             os.close(fd)
 
 
-__all__ = ["LockBusy", "project_lock"]
+@contextlib.asynccontextmanager
+async def async_project_lock(
+    project_dir: str | os.PathLike[str],
+    *,
+    timeout: float = 5.0,
+):
+    """Acquire a project lock without blocking the event loop."""
+
+    cm = project_lock(project_dir, timeout=timeout)
+    await asyncio.to_thread(cm.__enter__)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(cm.__exit__, None, None, None)
+
+
+__all__ = ["LockBusy", "async_project_lock", "project_lock"]

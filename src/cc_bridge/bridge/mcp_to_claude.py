@@ -25,6 +25,7 @@ from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
 from .executor import AgentExecutor
 from .handoff import execution_to_handoff, handoff_goal_text
+from .locks import LockBusy, async_project_lock
 from .parser import ResultParser
 from .status import check_claude
 
@@ -238,7 +239,7 @@ async def claude_handoff(
         prompt = ContextBuilder().build_task_prompt(
             handoff_goal_text(request), project_ctx, caller="codex"
         )
-        async with _claude_session_lock(cwd):
+        async with async_project_lock(cwd, timeout=5.0), _claude_session_lock(cwd):
             resume_session_id = (
                 _CLAUDE_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
             )
@@ -262,6 +263,13 @@ async def claude_handoff(
         parsed = ResultParser().parse(result, "claude")
         summary = ResultParser().summarize_for_caller(parsed, "claude")
         return execution_to_handoff(handoff_id, request, result, summary, "claude")
+    except LockBusy:
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.project_busy,
+            reason="Another bridge process is handling this project; try again shortly.",
+            status="failed",
+        )
     except Exception as exc:  # noqa: BLE001 — 兜底,绝不向 MCP 抛异常
         return fail_closed_result(
             handoff_id,
