@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -21,7 +22,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from . import config
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
+from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
 from .executor import AgentExecutor
+from .handoff import execution_to_handoff, handoff_goal_text
 from .parser import ResultParser
 from .status import check_claude
 
@@ -197,6 +200,74 @@ async def claude_analyze(
             "调用 Claude 时出现内部错误，未能完成任务。\n"
             f"错误信息：{exc}\n"
             "请确认 Claude 命令行已安装并已登录（Claude 桌面版 + Max 账号），再重试。"
+        )
+
+
+@mcp.tool(
+    name="claude_handoff",
+    description=(
+        "【v0.2 结构化委派 · 骨架】把一份结构化委派合同(HandoffRequest:目标 / 验收标准 / "
+        "申请的权限范围 requested_scope / 检查项 check_ids)交给 Claude,返回结构化结果 "
+        "HandoffResult。与 claude_analyze 的区别:输入输出都是版本化结构,且 requested_scope "
+        "只是【申请】、绝不自动授权。【当前为骨架:在策略(PR5)与内容证据(PR4)子系统接入前,"
+        "一律以只读 plan 模式执行、不授权任何写入】。project_dir 必填、须为存在的绝对路径。"
+    ),
+)
+async def claude_handoff(
+    request: HandoffRequest,
+    project_dir: str | None = None,
+    continue_session: bool = False,
+    ctx: Context = None,
+) -> HandoffResult:
+    """把结构化合同交给 Claude(骨架:只读 plan),返回 HandoffResult,绝不向 MCP 抛异常。"""
+    handoff_id = uuid.uuid4().hex[:12]
+    try:
+        cwd = str(Path(require_project_dir(project_dir)).resolve())
+    except (OSError, ValueError) as exc:
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.invalid_contract,
+            reason=f"project_dir 无效:{exc}",
+            status="failed",
+        )
+    try:
+        on_progress = _make_progress_callback(ctx)
+        project_ctx = await asyncio.to_thread(
+            ContextBuilder().build_project_context, cwd
+        )
+        prompt = ContextBuilder().build_task_prompt(
+            handoff_goal_text(request), project_ctx, caller="codex"
+        )
+        async with _claude_session_lock(cwd):
+            resume_session_id = (
+                _CLAUDE_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
+            )
+            result = await AgentExecutor().run_claude(
+                prompt,
+                cwd,
+                timeout=request.timeout_seconds,
+                resume_session_id=resume_session_id,
+                on_progress=on_progress,
+                permission_override="plan",  # 骨架:只读 plan 模式,绝不授权写
+            )
+            if result.session_id:
+                _remember_claude_session(cwd, result.session_id)
+        append_audit_record(
+            direction="claude",
+            cwd=cwd,
+            task=handoff_goal_text(request),
+            success=result.success,
+            files_changed=result.files_changed,
+        )
+        parsed = ResultParser().parse(result, "claude")
+        summary = ResultParser().summarize_for_caller(parsed, "claude")
+        return execution_to_handoff(handoff_id, request, result, summary, "claude")
+    except Exception as exc:  # noqa: BLE001 — 兜底,绝不向 MCP 抛异常
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.crashed,
+            reason=f"调用 Claude 时内部错误:{exc}",
+            status="failed",
         )
 
 
