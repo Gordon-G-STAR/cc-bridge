@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -43,6 +45,18 @@ def test_is_within_self_and_parent(tmp_path):
 # ---------------------------------------------------------------------------
 # resolve_within_root:正常 / .. 逃逸 / 绝对
 # ---------------------------------------------------------------------------
+
+def test_resolve_failures_fail_closed(monkeypatch, tmp_path):
+    def fail_resolve(self, *args, **kwargs):
+        raise OSError("forced resolve failure")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+    r = resolve_within_root("src/auth/session.py", str(tmp_path))
+    assert r.within_root is False
+    assert r.reason
+    assert is_within(tmp_path / "src" / "auth" / "session.py", tmp_path) is False
+
 
 def test_accepts_normal_relative(tmp_path):
     r = resolve_within_root("src/auth/session.py", str(tmp_path))
@@ -151,7 +165,7 @@ def test_real_ads_stream_on_windows(tmp_path):
     assert path_has_ads(ads)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="junction 是 Windows reparse(mklink /J)")
+@pytest.mark.skipif(sys.platform != "win32", reason="junction is a Windows reparse point (mklink /J)")
 def test_junction_detected_on_windows(tmp_path):
     import subprocess
 
@@ -163,16 +177,39 @@ def test_junction_detected_on_windows(tmp_path):
         capture_output=True, text=True,
     )
     if res.returncode != 0 or not junction.exists():
-        pytest.skip(f"无法创建 junction: {res.stderr or res.stdout}")
+        pytest.skip(f"cannot create junction: {res.stderr or res.stdout}")
     assert reparse_tag(junction) is not None
     assert "junction" in path_taints(junction)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junction is a Windows reparse point (mklink /J)")
+def test_missing_leaf_under_junction_inherits_ancestor_taint(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    junction = root / "jx"
+    res = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 or not junction.exists():
+        pytest.skip(f"cannot create junction: {res.stderr or res.stdout}")
+
+    r = resolve_within_root("jx/missing-leaf.txt", str(root))
+    assert "junction" in r.taints
 
 
 def test_dotgit_detection():
     assert is_dotgit_path(".git/hooks/pre-commit")
     assert is_dotgit_path("a/.git/config")
     assert is_dotgit_path(".git")
+    assert is_dotgit_path("a/.GIT/x")
+    assert is_dotgit_path("a/.git./x")
+    assert is_dotgit_path("a/.git /x")
     assert not is_dotgit_path("src/git/x")        # 'git' != '.git'
+    assert not is_dotgit_path("src/.gitignore")
     assert not is_dotgit_path("src/.github/ci")   # '.github' != '.git'
 
 

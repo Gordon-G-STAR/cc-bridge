@@ -20,26 +20,30 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _resolve(path: Path) -> Path:
-    """resolve(解符号链接 + ``..``);不存在的尾部按词法拼接,不报错。
+def _try_resolve(path: Path) -> tuple[Path, bool]:
+    """resolve(解符号链接 + ``..``);返回 ``(路径, 是否解析成功)``。
 
-    极端情况(循环符号链接等)resolve 会抛 ``OSError``/``RuntimeError``,
-    回退到 ``absolute()``(仅词法)——调用方据 within_root=False 保守处理。
+    解析失败(符号链接环 / reparse 解析失败等)返回 ``(词法 absolute(), False)``——
+    调用方【必须】据 ok=False 走 fail-closed(判为越界),绝不拿未真实解析的词法路径
+    当作"在根内"。这是 containment 的关键:解析不了 ≠ 安全。
     """
     try:
-        return path.resolve()
+        return path.resolve(), True
     except (OSError, RuntimeError):
-        return path.absolute()
+        return path.absolute(), False
 
 
 def is_within(child: Path, parent: Path) -> bool:
     """``child`` 解析后是否落在 ``parent`` 之内(含 ``parent`` 本身)。
 
     分量级:``src/auth`` 不会命中 ``src/auth_secrets``。两侧都 resolve,故符号链接 /
-    ``..`` 逃逸会被抓到。Windows 上路径比较大小写不敏感。
+    ``..`` 逃逸会被抓到;**任一侧解析失败即 fail-closed 返回 False**。Windows 上路径
+    比较大小写不敏感。
     """
-    c = _resolve(child)
-    p = _resolve(parent)
+    c, ok_c = _try_resolve(child)
+    p, ok_p = _try_resolve(parent)
+    if not (ok_c and ok_p):
+        return False  # 解析失败 => 保守判为不在内
     if c == p:
         return True
     try:
@@ -90,13 +94,17 @@ def path_has_ads(path_str: str) -> bool:
 
 
 def is_dotgit_path(path_str: str) -> bool:
-    """路径是否触及 ``.git/``(任何分量为 ``.git``)。
+    """路径是否触及 ``.git/``(任何分量【归一化后】等于 ``.git``)。
 
-    agent 写 ``.git/`` 是 critical 越界:它会污染桥自己后续的 git 快照调用
-    (hooks / filters / config),把"验证安全"的证据机制反过来变成执行通道。
+    归一化 = casefold + 去尾部点/空格,挡住 Windows 上 ``.GIT`` / ``.git.`` / ``.git ``
+    这类指向同一目录的别名。agent 写 ``.git/`` 是 critical 越界:会污染桥自己后续的
+    git 快照调用(hooks / filters / config),把"验证安全"的证据机制反过来变成执行通道。
     """
     norm = str(path_str).replace("\\", "/")
-    return any(c == ".git" for c in norm.split("/") if c)
+    for component in norm.split("/"):
+        if component and component.strip().rstrip(". ").casefold() == ".git":
+            return True
+    return False
 
 
 def hardlink_count(path) -> int | None:
@@ -171,37 +179,62 @@ class ResolvedPathIdentity:
     reason: str | None = None    # 越界/异常原因
 
 
+def _nearest_existing(path: Path) -> Path | None:
+    """从 ``path`` 向上找最近的【已存在(或符号链接)】祖先;找不到返回 None。
+
+    用于:申请路径的叶子还不存在,但某个祖先是可疑 junction/symlink 时,仍能把
+    祖先的 taint 标出来(有界上溯,绝不无限循环)。
+    """
+    current = path.parent
+    for _ in range(64):
+        try:
+            if current.is_symlink() or current.exists():
+                return current
+        except OSError:
+            return None
+        if current == current.parent:
+            break
+        current = current.parent
+    return None
+
+
 def resolve_within_root(requested: str, project_root: str) -> ResolvedPathIdentity:
     """把一条申请的(相对)路径解析到项目根下,判定是否越界。
 
     ``requested`` 期望已由 contracts 词法层保证为相对、无 ``..``、无冒号;但这里仍做
-    运行期 resolve 兜底(符号链接 / ``..`` 在词法层看不到)。
+    运行期 resolve 兜底(符号链接 / ``..`` 在词法层看不到)。解析失败即 fail-closed。
     """
-    root = _resolve(Path(project_root))
+    root, ok_root = _try_resolve(Path(project_root))
     raw = Path(project_root) / requested
-    target = _resolve(raw)
+    target, ok_target = _try_resolve(raw)
 
-    try:
-        within = target == root or target.is_relative_to(root)
-    except (OSError, ValueError):
+    reason: str | None = None
+    if not (ok_root and ok_target):
         within = False
+        reason = "路径解析失败(符号链接环 / reparse 解析失败等),保守判为越界"
+    else:
+        try:
+            within = target == root or target.is_relative_to(root)
+        except (OSError, ValueError):
+            within = False
+        if not within:
+            reason = f"解析后越出项目根:{target} 不在 {root} 内"
 
     project_relative: str | None = None
-    reason: str | None = None
     if within:
         try:
             project_relative = "." if target == root else str(target.relative_to(root))
         except ValueError:
             within = False
-    if not within:
-        reason = f"解析后越出项目根:{target} 不在 {root} 内"
+            reason = "relative_to 计算失败,保守判为越界"
 
     try:
         is_symlink = raw.is_symlink()
     except OSError:
         is_symlink = False
 
-    # taints:词法层(ads/reserved)对 requested 恒判;文件系统层仅当 raw 真实存在。
+    # taints:词法层(ads/reserved/dotgit)对 requested 恒判;文件系统层针对 raw,
+    # raw 不存在时退查【最近的已存在祖先】(可疑 junction/symlink 父链)。
     detected: list[str] = []
     if path_has_ads(requested):
         detected.append("ads")
@@ -209,8 +242,9 @@ def resolve_within_root(requested: str, project_root: str) -> ResolvedPathIdenti
         detected.append("reserved_name")
     if is_dotgit_path(requested):
         detected.append("dotgit")
-    if is_symlink or raw.exists():
-        for tag in path_taints(raw):
+    fs_target = raw if (is_symlink or raw.exists()) else _nearest_existing(raw)
+    if fs_target is not None:
+        for tag in path_taints(fs_target):
             if tag not in detected:
                 detected.append(tag)
 
