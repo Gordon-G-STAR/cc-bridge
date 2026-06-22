@@ -210,6 +210,11 @@ class ResultParser:
         try:
             out_dir = config.stable_app_dir() / "outputs"
             out_dir.mkdir(parents=True, exist_ok=True)
+            if not config.IS_WINDOWS:
+                try:
+                    os.chmod(out_dir, 0o700)  # 目录也收紧:POSIX 仅 owner 可进入
+                except OSError:
+                    pass
             # 写新文件前先清到 MAX-1,加上这一个 => 至多 MAX。
             _prune_saved_outputs(out_dir, _MAX_SAVED_OUTPUTS - 1)
             fd, path = tempfile.mkstemp(

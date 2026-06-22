@@ -31,6 +31,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # 当前合同版本。新增破坏性字段时升它,旧版 server 见到未知版本即 fail-closed。
 CONTRACT_VERSION = "1"
 
+# writable_path 词法层的单条长度上限(资源边界,fail-closed)。
+_MAX_WRITABLE_PATH_LEN = 1024
+
 
 class FailureKind(str, Enum):
     """结构化失败原因。failover / 审计在它上面分支,绝不解析自由文本。"""
@@ -65,12 +68,16 @@ def _validate_writable_path(raw: str) -> str:
     text = raw.strip()
     if not text:
         raise ValueError("writable_path 不能为空")
+    if len(text) > _MAX_WRITABLE_PATH_LEN:
+        raise ValueError(f"writable_path 过长(>{_MAX_WRITABLE_PATH_LEN}):{raw!r}")
     normalized = text.replace("\\", "/")
     # 绝对路径:POSIX '/...'、UNC '//...'、Windows 盘符 'C:...'。
     if normalized.startswith("/"):
         raise ValueError(f"writable_path 必须是相对路径,收到绝对/UNC 路径:{raw!r}")
-    if len(normalized) >= 2 and normalized[1] == ":":
-        raise ValueError(f"writable_path 必须是相对路径,收到盘符路径:{raw!r}")
+    # 拒绝任何 ':'——既挡 Windows 盘符(C:...),也挡 NTFS ADS 流(foo:bar)。
+    # 词法层一律拒;更深的流枚举留给 PR2 的 ResolvedPathIdentity。
+    if ":" in normalized:
+        raise ValueError(f"writable_path 不允许 ':'(盘符或 NTFS ADS 流):{raw!r}")
     parts = [p for p in normalized.split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise ValueError(f"writable_path 不允许 '..' 分量:{raw!r}")
@@ -89,9 +96,9 @@ class RequestedScope(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    writable_paths: list[str] = Field(default_factory=list)
+    writable_paths: list[str] = Field(default_factory=list, max_length=256)
     network: Literal["deny", "request"] = "deny"
-    check_ids: list[str] = Field(default_factory=list)
+    check_ids: list[str] = Field(default_factory=list, max_length=64)
 
     @field_validator("writable_paths")
     @classmethod

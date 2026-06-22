@@ -113,6 +113,9 @@ def test_writable_path_normalization(good, expected):
         "..",                   # 纯 ..
         "",                     # 空
         "   ",                  # 仅空白
+        "foo:bar",              # NTFS ADS 流
+        "1:x",                  # 任意冒号
+        "src/auth:secret",      # 分量里的 ADS
     ],
 )
 def test_writable_path_rejects_escapes(bad):
@@ -188,3 +191,10 @@ def test_handoff_result_status_literal():
         HandoffResult(
             contract_version="1", handoff_id="h", status="kinda-worked"
         )
+
+
+def test_writable_path_count_and_length_bounds():
+    with pytest.raises(ValidationError):
+        RequestedScope(writable_paths=["a/" * 600])                   # 单条 >1024 字符
+    with pytest.raises(ValidationError):
+        RequestedScope(writable_paths=[f"f{i}" for i in range(300)])  # >256 条
