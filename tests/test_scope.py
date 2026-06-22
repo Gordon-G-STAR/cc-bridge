@@ -6,11 +6,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
 
-from cc_bridge.bridge.scope import is_within, resolve_within_root
+from cc_bridge.bridge.scope import (
+    is_reserved_component,
+    is_within,
+    path_has_ads,
+    path_has_reserved_name,
+    path_taints,
+    reparse_tag,
+    resolve_within_root,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -91,3 +100,68 @@ def test_windows_case_insensitive(tmp_path):
     assert is_within(tmp_path / "SRC" / "Auth", tmp_path / "src" / "auth")
     r = resolve_within_root("SRC/Auth", str(tmp_path / "src"))
     assert r.within_root
+
+
+# ---------------------------------------------------------------------------
+# PR2b —— Windows 危险路径形态检测(词法部分跨平台,真实 fs 部分仅 Windows)
+# ---------------------------------------------------------------------------
+
+def test_reserved_name_detection():
+    assert path_has_reserved_name("src/NUL")
+    assert path_has_reserved_name("a/con.txt/b")        # 带扩展名仍是保留名
+    assert is_reserved_component("COM1")
+    assert is_reserved_component("nul")                  # 大小写不敏感
+    assert is_reserved_component("PRN. ")                # 尾部点/空格被吞
+    assert not path_has_reserved_name("src/auth/session.py")
+    assert not is_reserved_component("console")          # 不是精确保留名
+
+
+def test_ads_detection():
+    assert path_has_ads("README.md:payload")
+    assert path_has_ads("C:/proj/README.md:payload")     # 盘符之后的冒号
+    assert path_has_ads("src/auth:secret")
+    assert not path_has_ads("C:/proj/README.md")         # 盘符锚点的冒号不算
+    assert not path_has_ads("src/auth/session.py")
+
+
+def test_resolve_flags_reserved_and_ads_lexically(tmp_path):
+    assert "reserved_name" in resolve_within_root("NUL", str(tmp_path)).taints
+    assert "ads" in resolve_within_root("README.md:payload", str(tmp_path)).taints
+    assert resolve_within_root("src/auth/x.py", str(tmp_path)).taints == ()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS 硬链接(os.link,无需管理员)")
+def test_hardlink_detected_on_windows(tmp_path):
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    alias = tmp_path / "alias.txt"
+    os.link(real, alias)
+    assert "hardlink_aliased" in path_taints(alias)
+    assert "hardlink_aliased" in path_taints(real)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS ADS 真实创建")
+def test_real_ads_stream_on_windows(tmp_path):
+    base = tmp_path / "doc.txt"
+    base.write_text("base", encoding="utf-8")
+    ads = f"{base}:hidden"
+    with open(ads, "w", encoding="utf-8") as fh:
+        fh.write("payload")
+    assert path_has_ads(ads)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junction 是 Windows reparse(mklink /J)")
+def test_junction_detected_on_windows(tmp_path):
+    import subprocess
+
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "jx"
+    res = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not junction.exists():
+        pytest.skip(f"无法创建 junction: {res.stderr or res.stdout}")
+    assert reparse_tag(junction) is not None
+    assert "junction" in path_taints(junction)
