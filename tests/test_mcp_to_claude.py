@@ -72,6 +72,52 @@ async def test_claude_analyze_success(monkeypatch, tmp_path):
     assert "docs/review.md" in out
 
 
+async def test_claude_analyze_default_does_not_add_dry_run_controls(
+    monkeypatch, tmp_path
+):
+    calls: list[dict] = []
+
+    async def _fake_run_claude(self, prompt, cwd, **kwargs):
+        calls.append({"prompt": prompt, "kwargs": kwargs})
+        return ExecutionResult(success=True, output="ok", duration_seconds=1.0)
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+    out = await mcp_to_claude.claude_analyze("normal task", project_dir=str(tmp_path))
+
+    assert "dry-run" not in out
+    assert "预演" not in out
+    assert "permission_override" not in calls[0]["kwargs"]
+    assert "dry run" not in calls[0]["prompt"].lower()
+    assert "不要真正修改文件" not in calls[0]["prompt"]
+
+
+async def test_claude_analyze_dry_run_uses_plan_and_marks_prompt_and_summary(
+    monkeypatch, tmp_path
+):
+    calls: list[dict] = []
+
+    async def _fake_run_claude(self, prompt, cwd, **kwargs):
+        calls.append({"prompt": prompt, "kwargs": kwargs})
+        return ExecutionResult(
+            success=True,
+            output="would edit docs/review.md",
+            duration_seconds=1.0,
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+    out = await mcp_to_claude.claude_analyze(
+        "plan an edit", project_dir=str(tmp_path), dry_run=True
+    )
+
+    assert calls[0]["kwargs"]["permission_override"] == "plan"
+    assert "dry run" in calls[0]["prompt"].lower()
+    assert "不要真正修改文件" in calls[0]["prompt"]
+    assert "dry-run" in out
+    assert "预演" in out
+
+
 async def test_claude_analyze_returns_and_reuses_session_id(monkeypatch, tmp_path):
     calls: list[str | None] = []
 
@@ -256,6 +302,7 @@ async def test_claude_analyze_ctx_is_injected_not_input_schema():
     tools = await mcp.list_tools()
     claude_tool = next(tool for tool in tools if tool.name == "claude_analyze")
     assert "ctx" not in claude_tool.inputSchema.get("properties", {})
+    assert "dry_run" in claude_tool.inputSchema.get("properties", {})
 
 
 @pytest.fixture(autouse=True)

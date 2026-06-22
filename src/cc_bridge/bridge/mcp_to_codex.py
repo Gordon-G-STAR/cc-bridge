@@ -27,6 +27,13 @@ from .status import check_codex
 
 mcp = FastMCP("bridge-to-codex")
 
+_DRY_RUN_PROMPT_SUFFIX = (
+    "\n\n这是预演（dry run）：只描述将要做的改动、会改哪些文件，"
+    "不要真正修改文件或落盘。"
+)
+_DRY_RUN_SUMMARY_PREFIX = "【dry-run 预演】\n"
+_DRY_RUN_CODEX_SANDBOX = "read-only"
+
 _CODEX_SESSIONS_BY_PROJECT: dict[str, str] = {}
 _CODEX_SESSION_LOCKS_BY_PROJECT: dict[str, asyncio.Lock] = {}
 _CODEX_SESSION_CACHE_MAX_PROJECTS = 256
@@ -80,6 +87,10 @@ def _remember_codex_session(cwd: str, session_id: str) -> None:
     _trim_codex_session_caches(protected_cwd=cwd)
 
 
+def _mark_dry_run_summary(summary: str) -> str:
+    return f"{_DRY_RUN_SUMMARY_PREFIX}{summary}"
+
+
 def _make_progress_callback(ctx: Context | None):
     """把 executor 的进度标签转成 MCP progress/info；任何异常都静默降级。"""
     if ctx is None:
@@ -122,7 +133,9 @@ def _make_progress_callback(ctx: Context | None):
         "- project_dir：【必填】当前项目的【绝对路径】（例如 "
         "  'C:/Users/me/proj' 或 '/home/me/proj'）。Codex 会以此为工作目录并在"
         "  其中改文件。【不传、传相对路径、或目录不存在都会被直接拒绝】——"
-        "  cc-bridge 不会猜测目录，以免在错误的地方改文件。\n\n"
+        "  cc-bridge 不会猜测目录，以免在错误的地方改文件。\n"
+        "- continue_session：传 true 续接该项目上一次的 Codex 会话（多轮接力）。\n"
+        "- dry_run：传 true 进入预演——Codex 只分析、说清会改什么，不真正落盘（read-only）。\n\n"
         "适用场景：需要落地的代码改动、写/修测试、重构、按规格生成新代码。"
         "返回值是 Codex 执行结果的自然语言摘要（含成功与否、改动的文件列表、说明）。"
     ),
@@ -131,6 +144,7 @@ async def codex_execute(
     task: str,
     project_dir: str | None = None,
     continue_session: bool = False,
+    dry_run: bool = False,
     ctx: Context = None,
 ) -> str:
     """让 Codex 在 ``project_dir`` 里执行 ``task``，返回结果摘要字符串。
@@ -150,14 +164,17 @@ async def codex_execute(
         project_ctx = await asyncio.to_thread(ContextBuilder().build_project_context, cwd)
         config.debug_log("codex_execute: 上下文就绪，开始调用 Codex")
         prompt = ContextBuilder().build_task_prompt(task, project_ctx, caller="claude")
+        if dry_run:
+            prompt += _DRY_RUN_PROMPT_SUFFIX
         async with _codex_session_lock(cwd):
             resume_session_id = _CODEX_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
-            result = await AgentExecutor().run_codex(
-                prompt,
-                cwd,
-                resume_session_id=resume_session_id,
-                on_progress=on_progress,
-            )
+            run_kwargs = {
+                "resume_session_id": resume_session_id,
+                "on_progress": on_progress,
+            }
+            if dry_run:
+                run_kwargs["sandbox_override"] = _DRY_RUN_CODEX_SANDBOX
+            result = await AgentExecutor().run_codex(prompt, cwd, **run_kwargs)
             if result.session_id:
                 _remember_codex_session(cwd, result.session_id)
         append_audit_record(
@@ -169,7 +186,10 @@ async def codex_execute(
         )
         config.debug_log(f"codex_execute: Codex 返回 success={result.success}")
         parsed = ResultParser().parse(result, "codex")
-        return ResultParser().summarize_for_caller(parsed, "codex")
+        summary = ResultParser().summarize_for_caller(parsed, "codex")
+        if dry_run:
+            return _mark_dry_run_summary(summary)
+        return summary
     except Exception as exc:  # noqa: BLE001 — 兜底，绝不向 MCP 抛异常
         return (
             "调用 Codex 时出现内部错误，未能完成任务。\n"

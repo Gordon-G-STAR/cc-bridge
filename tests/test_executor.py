@@ -431,6 +431,46 @@ async def test_run_codex_argv_respects_sandbox_and_model(
     assert "-m" in argv and "o3" in argv
 
 
+async def test_run_codex_sandbox_override_uses_read_only_without_mutating_config(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    fake = fake_run_factory(stdout="ok")
+    _install_fake_run(monkeypatch, fake)
+
+    cfg = ex.config.BridgeConfig(codex_sandbox="danger-full-access")
+    await ex.AgentExecutor(cfg).run_codex(
+        "x", str(tmp_path), sandbox_override="read-only"
+    )
+    argv = fake.calls[0]["argv"]
+
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "danger-full-access" not in argv
+    assert cfg.codex_sandbox == "danger-full-access"
+
+
+async def test_run_codex_resume_sandbox_override_uses_read_only_config(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    fake = fake_run_factory(stdout="ok")
+    _install_fake_run(monkeypatch, fake)
+
+    cfg = ex.config.BridgeConfig(codex_sandbox="workspace-write")
+    await ex.AgentExecutor(cfg).run_codex(
+        "x",
+        str(tmp_path),
+        resume_session_id="sid-123",
+        sandbox_override="read-only",
+    )
+    argv = fake.calls[0]["argv"]
+
+    assert "sandbox_mode=read-only" in argv
+    assert "sandbox_mode=workspace-write" not in argv
+
+
 async def test_run_codex_resume_argv_uses_session_and_stdin_dash(
     monkeypatch, fake_run_factory, tmp_path
 ):
@@ -613,6 +653,40 @@ async def test_run_claude_argv_uses_print_stream_json(
     assert "--model" in argv and "opus" in argv
     for bad in ("-q", "exec", "--full-auto"):
         assert bad not in argv
+
+
+async def test_run_claude_argv_uses_configured_permission_by_default(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    fake = fake_run_factory(stdout="{}")
+    _install_fake_run(monkeypatch, fake)
+
+    cfg = ex.config.BridgeConfig(claude_permission_mode="bypassPermissions")
+    await ex.AgentExecutor(cfg).run_claude("x", str(tmp_path))
+    argv = fake.calls[0]["argv"]
+
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+async def test_run_claude_permission_override_uses_plan_without_mutating_config(
+    monkeypatch, fake_run_factory, tmp_path
+):
+    _patch_cli_available(monkeypatch)
+    _patch_no_git(monkeypatch)
+    fake = fake_run_factory(stdout="{}")
+    _install_fake_run(monkeypatch, fake)
+
+    cfg = ex.config.BridgeConfig(claude_permission_mode="bypassPermissions")
+    await ex.AgentExecutor(cfg).run_claude(
+        "x", str(tmp_path), permission_override="plan"
+    )
+    argv = fake.calls[0]["argv"]
+
+    assert argv[argv.index("--permission-mode") + 1] == "plan"
+    assert "bypassPermissions" not in argv
+    assert cfg.claude_permission_mode == "bypassPermissions"
 
 
 async def test_run_claude_resume_argv_uses_session_and_stdin(

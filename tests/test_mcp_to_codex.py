@@ -70,6 +70,52 @@ async def test_codex_execute_success(monkeypatch, tmp_path):
     assert "src/foo.py" in out
 
 
+async def test_codex_execute_default_does_not_add_dry_run_controls(
+    monkeypatch, tmp_path
+):
+    calls: list[dict] = []
+
+    async def _fake_run_codex(self, prompt, cwd, **kwargs):
+        calls.append({"prompt": prompt, "kwargs": kwargs})
+        return ExecutionResult(success=True, output="ok", duration_seconds=1.0)
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake_run_codex)
+
+    out = await mcp_to_codex.codex_execute("normal task", project_dir=str(tmp_path))
+
+    assert "dry-run" not in out
+    assert "预演" not in out
+    assert "sandbox_override" not in calls[0]["kwargs"]
+    assert "dry run" not in calls[0]["prompt"].lower()
+    assert "不要真正修改文件" not in calls[0]["prompt"]
+
+
+async def test_codex_execute_dry_run_uses_read_only_and_marks_prompt_and_summary(
+    monkeypatch, tmp_path
+):
+    calls: list[dict] = []
+
+    async def _fake_run_codex(self, prompt, cwd, **kwargs):
+        calls.append({"prompt": prompt, "kwargs": kwargs})
+        return ExecutionResult(
+            success=True,
+            output="would edit src/foo.py and tests/test_foo.py",
+            duration_seconds=1.0,
+        )
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake_run_codex)
+
+    out = await mcp_to_codex.codex_execute(
+        "plan an edit", project_dir=str(tmp_path), dry_run=True
+    )
+
+    assert calls[0]["kwargs"]["sandbox_override"] == "read-only"
+    assert "dry run" in calls[0]["prompt"].lower()
+    assert "不要真正修改文件" in calls[0]["prompt"]
+    assert "dry-run" in out
+    assert "预演" in out
+
+
 async def test_codex_execute_returns_and_reuses_session_id(monkeypatch, tmp_path):
     """continue_session=True 时续接同一 project_dir 上一次记录的 Codex session。"""
     calls: list[str | None] = []
@@ -305,6 +351,7 @@ async def test_codex_execute_ctx_is_injected_not_input_schema():
     tools = await mcp.list_tools()
     codex_tool = next(tool for tool in tools if tool.name == "codex_execute")
     assert "ctx" not in codex_tool.inputSchema.get("properties", {})
+    assert "dry_run" in codex_tool.inputSchema.get("properties", {})
 
 
 @pytest.fixture(autouse=True)

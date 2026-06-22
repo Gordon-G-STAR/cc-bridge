@@ -716,18 +716,24 @@ class AgentExecutor:
         timeout: int | None = None,
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
+        permission_override: str | None = None,
     ) -> ExecutionResult:
         exe = config.resolve_cli("claude")
         if not exe:
             return _unavailable("claude")
 
+        permission_mode = (
+            permission_override
+            if permission_override is not None
+            else self.cfg.claude_permission_mode
+        )
         args = [
             "-p",
             "--output-format",
             "stream-json",
             "--verbose",
             "--permission-mode",
-            self.cfg.claude_permission_mode,
+            permission_mode,
         ]
         if self.cfg.claude_model:
             args += ["--model", self.cfg.claude_model]
@@ -752,11 +758,15 @@ class AgentExecutor:
         timeout: int | None = None,
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
+        sandbox_override: str | None = None,
     ) -> ExecutionResult:
         exe = config.resolve_cli("codex")
         if not exe:
             return _unavailable("codex")
 
+        sandbox = (
+            sandbox_override if sandbox_override is not None else self.cfg.codex_sandbox
+        )
         out_fd, out_path = tempfile.mkstemp(prefix="cc_bridge_codex_", suffix=".txt")
         os.close(out_fd)
         if resume_session_id:
@@ -764,7 +774,7 @@ class AgentExecutor:
                 "exec",
                 "resume",
                 "-c",
-                f"sandbox_mode={self.cfg.codex_sandbox}",
+                f"sandbox_mode={sandbox}",
                 resume_session_id,
                 "--skip-git-repo-check",
                 "--json",
@@ -775,7 +785,7 @@ class AgentExecutor:
             args = [
                 "exec",
                 "--sandbox",
-                self.cfg.codex_sandbox,
+                sandbox,
                 "--skip-git-repo-check",
                 "--json",
                 "-o",
