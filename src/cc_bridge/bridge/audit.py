@@ -38,10 +38,11 @@ def append_audit_record(
             "success": bool(success),
             "files_changed": list(files_changed or []),
         }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # 一次性写整行(含换行),减少多进程并发追加时交错出坏行的概率。
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-            handle.write("\n")
+            handle.write(line)
     except Exception:
         pass
