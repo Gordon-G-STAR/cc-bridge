@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cc-bridge"
+version = "0.1.0"
+description = "Claude x Codex auto-collaboration bridge — let Claude Desktop call Codex and vice versa, using subscription quota (no API keys)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "cc-bridge" }]
+keywords = ["mcp", "claude", "codex", "bridge", "agent"]
+dependencies = [
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+build = [
+    "pyinstaller>=6.0",
+]
+# macOS-only packaging helpers (dmgbuild does not install/run on Windows or Linux)
+build-macos = [
+    "pyinstaller>=6.0",
+    "dmgbuild>=1.6",
+]
+
+[project.scripts]
+# Thin headless CLI used by the GUI installer and for diagnostics / CI.
+cc-bridge = "cc_bridge.cli:main"
+# GUI installer entry point (tkinter).
+cc-bridge-install = "cc_bridge.installer.main:main"
+# MCP server entry points (alternatives to `python -m cc_bridge.bridge.mcp_to_*`).
+cc-bridge-mcp-codex = "cc_bridge.bridge.mcp_to_codex:main"
+cc-bridge-mcp-claude = "cc_bridge.bridge.mcp_to_claude:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cc_bridge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests that invoke the real claude/codex CLIs (deselect with -m 'not integration')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

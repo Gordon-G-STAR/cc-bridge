@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.spec
+
+# venv / 工具缓存
+.venv/
+venv/
+.pytest_cache/
+.pytest-tmp/
+.tmp/
+.ruff_cache/
+.mypy_cache/
+
+# PyInstaller 打包产物
+/dist/
+/build/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
