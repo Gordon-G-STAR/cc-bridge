@@ -13,20 +13,26 @@ PR5 起,handoff 不再恒为只读骨架:``requested_scope`` 经
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from dataclasses import dataclass
 
-from . import policy as policy_mod
+from . import evidence, policy as policy_mod
 from .config import BridgeConfig
+from .context import ContextBuilder
 from .contracts import (
     CONTRACT_VERSION,
     FailureKind,
     HandoffRequest,
     HandoffResult,
     SideEffects,
+    SideEffectStatus,
     fail_closed_result,
 )
 from .evidence import EvidenceResult
-from .executor import ExecutionResult
+from .executor import AgentExecutor, ExecutionResult
+from .locks import async_project_lock
+from .parser import ResultParser
 
 
 def handoff_goal_text(request: HandoffRequest) -> str:
@@ -215,4 +221,155 @@ def execution_to_handoff(
         duration_seconds=result.duration_seconds,
         token_usage=result.token_usage,
         evidence_level="unknown",
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR7:透明 failover —— 仅在主 agent【可证明零副作用】时,才切到另一个 agent。
+#
+# 严格的"side_effect_state == none"证明:唯一满足的失败是 ``agent_unavailable``——
+# 对应对方 CLI 缺失 / 启动失败,子进程【从未运行】,故任何类别(磁盘 / 进程 / 网络 /
+# 外部服务)都不可能有副作用。其余失败(超时 / 崩溃 / 限流)可能已执行,网络又是
+# ``unsupported``(无法证明为 none),一律不切。额外校验工作区证据为空作双保险。
+#
+# 设计:failover 在 orchestrator(本模块)做,不进 ``AgentExecutor``;``route_reason``
+# 透明记录切换;只有 ``request.allow_fallback=True`` 才启用——显式指定的工具(主 agent)
+# 永远优先,自动 failover 绝不覆盖显式选择。
+# ---------------------------------------------------------------------------
+
+# 仅这些失败种类【可能】可证明零副作用(再叠加证据校验)。
+# 当前只有 agent_unavailable:它由 executor 的 ``ExecutionResult.agent_unavailable`` 推出
+# (exit_code 为 None、未超时、未成功)——子进程【从未产生退出码】,即从未真正启动 / 启动失败,
+# 故任何类别(磁盘 / 进程 / 网络 / 外部服务)都不可能有副作用。这是【结构化】结论,非自由文本。
+_FAILOVER_SAFE_KINDS = frozenset({FailureKind.agent_unavailable})
+
+# 任何类别一旦【检出】副作用(已回滚 / 未回滚)就绝不切——双保险,防 agent_unavailable
+# 语义未来被改动后悄悄放行。
+_DETECTED_STATUSES = frozenset(
+    {SideEffectStatus.detected_and_reverted, SideEffectStatus.detected_but_not_reverted}
+)
+_SIDE_EFFECT_FIELDS = (
+    "worktree_files",
+    "outside_project_files",
+    "git_index",
+    "git_refs",
+    "processes",
+    "external_services",
+)
+
+
+def is_failover_safe(result: HandoffResult) -> bool:
+    """主 agent 是否【可证明零副作用】,从而允许 failover。
+
+    三重证明:(1) ``failure_kind == agent_unavailable``(进程从未启动);(2) 无 verified 写、
+    无越界;(3) 副作用向量里【任何】类别都未检出效果(detected_*),且工作区为 ``none``。
+    任一不满足即不切——绝不在可能已落盘 / 已产生外部效果后改交另一个 agent。
+    """
+    if result.failure_kind not in _FAILOVER_SAFE_KINDS:
+        return False
+    if result.verified_files_changed or result.scope_violations:
+        return False
+    se = result.side_effects
+    if any(getattr(se, field) in _DETECTED_STATUSES for field in _SIDE_EFFECT_FIELDS):
+        return False
+    return se.worktree_files == SideEffectStatus.none
+
+
+def _other_agent(agent: str) -> str:
+    return "claude" if agent == "codex" else "codex"
+
+
+async def execute_fallback(
+    target_agent: str,
+    request: HandoffRequest,
+    cwd: str,
+    *,
+    cfg: BridgeConfig,
+    caller: str,
+    on_progress=None,
+) -> HandoffResult:
+    """在 orchestrator 层对【另一个】agent 执行同一份合同(failover 的执行腿)。
+
+    走与主路径完全相同的强制路径:本地策略重授权 -> 上下文 -> 跨进程项目锁 -> 执行 -> 证据。
+    绝不在 ``AgentExecutor`` 内部做切换。
+    """
+    handoff_id = uuid.uuid4().hex[:12]
+    plan = authorize(handoff_id, request, cwd, agent=target_agent, cfg=cfg)
+    if isinstance(plan, HandoffResult):
+        return plan
+
+    before = evidence.baseline(cwd)
+    project_ctx = await asyncio.to_thread(ContextBuilder().build_project_context, cwd)
+    prompt = ContextBuilder().build_task_prompt(
+        handoff_goal_text(request), project_ctx, caller=caller
+    )
+    executor = AgentExecutor(cfg)
+    async with async_project_lock(cwd, timeout=5.0):
+        if target_agent == "codex":
+            result = await executor.run_codex(
+                prompt,
+                cwd,
+                timeout=request.timeout_seconds,
+                on_progress=on_progress,
+                sandbox_override=plan.engine_mode,
+                extra_env=plan.child_env,
+            )
+        else:
+            result = await executor.run_claude(
+                prompt,
+                cwd,
+                timeout=request.timeout_seconds,
+                on_progress=on_progress,
+                permission_override=plan.engine_mode,
+                extra_env=plan.child_env,
+            )
+    ev = evidence.gather(cwd, before, writable_paths=plan.effective_writable)
+    parsed = ResultParser().parse(result, target_agent)
+    summary = ResultParser().summarize_for_caller(parsed, target_agent)
+    return execution_to_handoff(
+        handoff_id, request, result, summary, target_agent, evidence=ev, plan=plan
+    )
+
+
+def _annotate_failover(
+    fb_result: HandoffResult, *, primary_agent: str, primary_result: HandoffResult, target: str
+) -> HandoffResult:
+    # 措辞如实:只说"已改交 target 处理",不预设 target 一定成功——target 自身可能再被
+    # 本地策略拒绝 / 失败,其真实 status 已在 fb_result 里,这里只补一句切换的来由。
+    kind = primary_result.failure_kind.value if primary_result.failure_kind else "?"
+    note = (
+        f"透明 failover:主 agent {primary_agent} 不可用(failure_kind={kind})、已证明无副作用,"
+        f"本次委派已改交 {target} 处理;{target} 的结果如下。"
+    )
+    return fb_result.model_copy(
+        update={"route_reason": f"{note} | {fb_result.route_reason}"}
+    )
+
+
+async def maybe_failover(
+    primary_result: HandoffResult,
+    *,
+    primary_agent: str,
+    request: HandoffRequest,
+    cwd: str,
+    cfg: BridgeConfig,
+    caller: str,
+    on_progress=None,
+) -> HandoffResult:
+    """主结果若【可证明零副作用】且合同允许回退,则透明切到另一个 agent;否则原样返回。
+
+    锁:本函数在【主路径项目锁释放后】运行,``execute_fallback`` 再自行获取同一把跨进程锁
+    (同进程换 fd 重入同一锁会死锁,故绝不在持锁时调用)。这看似留出"主验证→回退执行"的
+    竞态窗口,但当前唯一的 failover-safe 失败是 ``agent_unavailable``——主 agent【从未运行】、
+    零改动,无任何跨锁不变量需要守护;回退腿又有自己完整的 baseline→exec→evidence 事务。
+    将来若放宽 failover-safe 到"真跑过但无副作用",必须把主验证与回退收进同一把事务锁。
+    """
+    if not request.allow_fallback or not is_failover_safe(primary_result):
+        return primary_result
+    target = _other_agent(primary_agent)
+    fb_result = await execute_fallback(
+        target, request, cwd, cfg=cfg, caller=caller, on_progress=on_progress
+    )
+    return _annotate_failover(
+        fb_result, primary_agent=primary_agent, primary_result=primary_result, target=target
     )

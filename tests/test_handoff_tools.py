@@ -484,3 +484,78 @@ async def test_claude_analyze_disabled_by_policy(monkeypatch, tmp_path):
     monkeypatch.setattr(AgentExecutor, "run_claude", _boom)
     out = await mcp_to_claude.claude_analyze("评审", project_dir=str(tmp_path))
     assert "禁用" in out
+
+
+# ---------------------------------------------------------------------------
+# PR7:透明 failover(主 agent 不可用 + 可证明零副作用 => 切到另一个)
+# ---------------------------------------------------------------------------
+
+def _fallback_req(allow_fallback: bool) -> HandoffRequest:
+    return HandoffRequest(
+        contract_version="1",
+        goal="做事",
+        requested_scope=RequestedScope(),
+        allow_fallback=allow_fallback,
+    )
+
+
+async def test_codex_handoff_fails_over_to_claude_when_unavailable(monkeypatch, tmp_path):
+    _hide_parent_git_repo(monkeypatch)
+
+    async def _codex_unavailable(self, prompt, cwd, **kwargs):
+        # exit_code=None 且非超时、非成功 => agent_unavailable(provably 零副作用)
+        return ExecutionResult(success=False, output="", exit_code=None, duration_seconds=0.1)
+
+    async def _claude_ok(self, prompt, cwd, **kwargs):
+        return ExecutionResult(success=True, output="Claude 接手完成", duration_seconds=1.0)
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _codex_unavailable)
+    monkeypatch.setattr(AgentExecutor, "run_claude", _claude_ok)
+
+    res = await mcp_to_codex.codex_handoff(
+        _fallback_req(allow_fallback=True), project_dir=str(tmp_path)
+    )
+    assert res.agent_used == "claude"
+    assert res.status == "completed"
+    assert "failover" in res.route_reason.lower()
+
+
+async def test_codex_handoff_no_failover_without_allow_fallback(monkeypatch, tmp_path):
+    _hide_parent_git_repo(monkeypatch)
+
+    async def _codex_unavailable(self, prompt, cwd, **kwargs):
+        return ExecutionResult(success=False, output="", exit_code=None, duration_seconds=0.1)
+
+    async def _claude_must_not_run(self, *a, **k):
+        raise AssertionError("未开启 allow_fallback 不应切到 Claude")
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _codex_unavailable)
+    monkeypatch.setattr(AgentExecutor, "run_claude", _claude_must_not_run)
+
+    res = await mcp_to_codex.codex_handoff(
+        _fallback_req(allow_fallback=False), project_dir=str(tmp_path)
+    )
+    assert res.agent_used == "codex"
+    assert res.failure_kind is FailureKind.agent_unavailable
+
+
+async def test_codex_handoff_no_failover_when_codex_merely_fails(monkeypatch, tmp_path):
+    """主 agent 真正运行但失败(非 agent_unavailable)=> 不可证明零副作用 => 不切。"""
+    _hide_parent_git_repo(monkeypatch)
+
+    async def _codex_crashed(self, prompt, cwd, **kwargs):
+        return ExecutionResult(
+            success=False, output="boom", exit_code=1, duration_seconds=1.0
+        )
+
+    async def _claude_must_not_run(self, *a, **k):
+        raise AssertionError("非 agent_unavailable 失败不应 failover")
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _codex_crashed)
+    monkeypatch.setattr(AgentExecutor, "run_claude", _claude_must_not_run)
+
+    res = await mcp_to_codex.codex_handoff(
+        _fallback_req(allow_fallback=True), project_dir=str(tmp_path)
+    )
+    assert res.agent_used == "codex"
+    assert res.status == "failed"

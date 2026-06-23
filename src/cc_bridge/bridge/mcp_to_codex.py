@@ -23,7 +23,7 @@ from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
 from .executor import AgentExecutor
-from .handoff import authorize, execution_to_handoff, handoff_goal_text
+from .handoff import authorize, execution_to_handoff, handoff_goal_text, maybe_failover
 from .locks import LockBusy, async_project_lock
 from .parser import ResultParser
 from .progress import make_progress_callback as _make_progress_callback
@@ -246,24 +246,37 @@ async def codex_handoff(
             if result.session_id:
                 _remember_codex_session(cwd, result.session_id)
         ev = evidence.gather(cwd, before, writable_paths=plan.effective_writable)
+        parsed = ResultParser().parse(result, "codex")
+        summary = ResultParser().summarize_for_caller(parsed, "codex")
+        primary_result = execution_to_handoff(
+            handoff_id, request, result, summary, "codex", evidence=ev, plan=plan
+        )
+        # PR7:主 agent 若【可证明零副作用】且合同允许,透明 failover 到 Claude。
+        final = await maybe_failover(
+            primary_result,
+            primary_agent="codex",
+            request=request,
+            cwd=cwd,
+            cfg=cfg,
+            caller="claude",
+            on_progress=on_progress,
+        )
         append_audit_record(
             direction="codex",
             cwd=cwd,
             task=handoff_goal_text(request),
-            success=result.success,
-            files_changed=result.files_changed,
+            success=final.status == "completed",
+            files_changed=final.verified_files_changed,
             extra={
                 "mode": "handoff",
                 "depth": plan.depth,
                 "write_granted": plan.write_granted,
                 "effective_writable": list(plan.effective_writable),
+                "agent_used": final.agent_used,
+                "failover": final.agent_used not in (None, "codex"),
             },
         )
-        parsed = ResultParser().parse(result, "codex")
-        summary = ResultParser().summarize_for_caller(parsed, "codex")
-        return execution_to_handoff(
-            handoff_id, request, result, summary, "codex", evidence=ev, plan=plan
-        )
+        return final
     except LockBusy:
         return fail_closed_result(
             handoff_id,
