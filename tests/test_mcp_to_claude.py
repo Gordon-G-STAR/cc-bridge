@@ -368,6 +368,34 @@ async def test_claude_handoff_async_initializes_and_spawns_runner(monkeypatch, t
     ]
 
 
+async def test_claude_handoff_async_rejects_when_concurrency_limit_is_full(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(handoff_store, "count_active", lambda: 4)
+    monkeypatch.setattr(config, "max_async_handoffs", lambda: 4)
+    monkeypatch.setattr(
+        handoff_store,
+        "init_handoff",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("并发上限已满时不应初始化 handoff")
+        ),
+    )
+    monkeypatch.setattr(
+        config,
+        "spawn_detached_runner",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("并发上限已满时不应启动 runner")
+        ),
+    )
+
+    out = await mcp_to_claude.claude_handoff_async(
+        _handoff_request(), project_dir=str(tmp_path)
+    )
+
+    assert out["state"] == "failed"
+    assert "并发上限" in out["note"]
+
+
 async def test_claude_handoff_status_and_result_read_store(monkeypatch):
     monkeypatch.setattr(
         handoff_store,
@@ -376,6 +404,7 @@ async def test_claude_handoff_status_and_result_read_store(monkeypatch):
         if handoff_id == "hid-running"
         else None,
     )
+    monkeypatch.setattr(handoff_store, "runner_alive", lambda handoff_id: True)
 
     assert await mcp_to_claude.claude_handoff_status("hid-running") == {
         "state": "running",
@@ -413,6 +442,45 @@ async def test_claude_handoff_status_and_result_read_store(monkeypatch):
         "state": "running",
         "note": "结果尚未就绪或不存在",
     }
+
+
+async def test_claude_handoff_status_marks_missing_runner_interrupted(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "stable_app_dir", lambda: tmp_path / "app")
+    handoff_id = handoff_store.init_handoff(
+        _handoff_request(), str(tmp_path), agent="claude", caller="codex"
+    )
+    handoff_store.write_status(handoff_id, "running", "busy")
+    handoff_store.write_pid(handoff_id, 2147483647)
+
+    out = await mcp_to_claude.claude_handoff_status(handoff_id)
+
+    assert out["state"] == "interrupted"
+    assert "runner" in out["note"]
+    assert handoff_store.read_status(handoff_id)["state"] == "interrupted"
+
+
+async def test_claude_handoff_cancel_kills_runner_and_marks_interrupted(monkeypatch):
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(handoff_store, "read_pid", lambda handoff_id: 98765)
+
+    def fake_kill_runner(pid):
+        calls["pid"] = pid
+        return True
+
+    def fake_write_status(handoff_id, state, note=""):
+        calls["status"] = (handoff_id, state, note)
+
+    monkeypatch.setattr(handoff_store, "kill_runner", fake_kill_runner)
+    monkeypatch.setattr(handoff_store, "write_status", fake_write_status)
+
+    out = await mcp_to_claude.claude_handoff_cancel("hid-cancel")
+
+    assert out == {"handoff_id": "hid-cancel", "state": "interrupted"}
+    assert calls["pid"] == 98765
+    assert calls["status"] == ("hid-cancel", "interrupted", "已取消")
 
 
 async def test_claude_status_ready(monkeypatch):

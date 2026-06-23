@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
+import subprocess
 import tempfile
 import uuid
 from datetime import UTC, datetime
@@ -28,6 +30,10 @@ _STATUS_STATES = frozenset(
     }
 )
 _TERMINAL_STATES = _STATUS_STATES - {"pending", "running"}
+_ACTIVE_STATES = frozenset({"pending", "running"})
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
 
 
 def _handoffs_root() -> Path:
@@ -183,6 +189,102 @@ def read_pid(handoff_id: str) -> int | None:
     except (OSError, TypeError, ValueError):
         return None
     return pid if pid > 0 else None
+
+
+def pid_alive(pid: int) -> bool:
+    """跨平台判断 PID 是否仍在运行。"""
+    if pid <= 0:
+        return False
+
+    if not config.IS_WINDOWS:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        handle = kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_uint32()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                # 检测失败时保守认为还活着，避免误报 interrupted。
+                return True
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        # Windows 进程 API 探测异常时宁可漏报中断，也不假装 runner 已结束。
+        return True
+
+
+def runner_alive(handoff_id: str) -> bool:
+    pid = read_pid(handoff_id)
+    if pid is None:
+        return False
+    return pid_alive(pid)
+
+
+def count_active() -> int:
+    active = 0
+    for handoff_id in list_handoffs():
+        status = read_status(handoff_id)
+        if status is None or status.get("state") not in _ACTIVE_STATES:
+            continue
+        if runner_alive(handoff_id):
+            active += 1
+    return active
+
+
+def kill_runner(pid: int) -> bool:
+    """杀掉 runner 进程树；失败只返回 False，由调用方转成状态。"""
+    if pid <= 0:
+        return False
+
+    if config.IS_WINDOWS:
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                **config.subprocess_creation_kwargs(),
+            )
+            return completed.returncode == 0
+        except Exception:
+            return False
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
 
 
 def list_handoffs() -> list[str]:

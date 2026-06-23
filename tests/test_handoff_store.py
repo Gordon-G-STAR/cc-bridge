@@ -64,6 +64,41 @@ def test_status_result_and_pid_round_trip(monkeypatch, tmp_path):
     assert handoff_store.read_pid(handoff_id) == 12345
 
 
+def test_pid_alive_detects_current_and_invalid_pids():
+    assert handoff_store.pid_alive(os.getpid()) is True
+    assert handoff_store.pid_alive(2147483647) is False
+    assert handoff_store.pid_alive(0) is False
+    assert handoff_store.pid_alive(-1) is False
+
+
+def test_runner_alive_reads_stored_pid(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "stable_app_dir", lambda: tmp_path / "app")
+    handoff_store.write_pid("current", os.getpid())
+    handoff_store.write_pid("missing-process", 2147483647)
+
+    assert handoff_store.runner_alive("current") is True
+    assert handoff_store.runner_alive("missing-process") is False
+    assert handoff_store.runner_alive("no-pid") is False
+
+
+def test_count_active_only_counts_live_pending_and_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "stable_app_dir", lambda: tmp_path / "app")
+    handoff_store.write_status("pending-live", "pending")
+    handoff_store.write_status("running-live", "running")
+    handoff_store.write_status("running-dead", "running")
+    handoff_store.write_status("completed-live", "completed")
+    handoff_store.write_status("failed-live", "failed")
+
+    monkeypatch.setattr(
+        handoff_store,
+        "runner_alive",
+        lambda handoff_id: handoff_id
+        in {"pending-live", "running-live", "completed-live", "failed-live"},
+    )
+
+    assert handoff_store.count_active() == 2
+
+
 def test_missing_and_bad_reads_return_none(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "stable_app_dir", lambda: tmp_path / "app")
     missing = "missing"

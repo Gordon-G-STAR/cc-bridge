@@ -109,6 +109,20 @@ def test_from_env_defaults(monkeypatch):
     assert cfg.claude_permission_mode == "bypassPermissions"
 
 
+def test_max_async_handoffs_reads_env_and_never_below_one(monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", raising=False)
+    assert config.max_async_handoffs() == 4
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "9")
+    assert config.max_async_handoffs() == 9
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "-3")
+    assert config.max_async_handoffs() == 1
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "not-a-number")
+    assert config.max_async_handoffs() == 4
+
+
 # ---------------------------------------------------------------------------
 # mcp_launch_command —— frozen 决策
 # ---------------------------------------------------------------------------

@@ -336,6 +336,20 @@ async def codex_handoff_async(
         return {"state": "failed", "note": f"project_dir 无效:{exc}"}
 
     try:
+        max_allowed = config.max_async_handoffs()
+        if handoff_store.count_active() >= max_allowed:
+            return {
+                "state": "failed",
+                "note": (
+                    "并发上限已满"
+                    f"(CC_BRIDGE_MAX_ASYNC_HANDOFFS={max_allowed}),"
+                    "请稍后再试或等已有任务完成"
+                ),
+            }
+    except Exception as exc:  # noqa: BLE001 - MCP 边界兜底，不能抛给宿主
+        return {"state": "failed", "note": f"并发检测失败:{exc}"}
+
+    try:
         handoff_id = handoff_store.init_handoff(
             request, cwd, agent="codex", caller="claude"
         )
@@ -364,7 +378,36 @@ async def codex_handoff_async(
 async def codex_handoff_status(handoff_id: str) -> dict:
     try:
         status = handoff_store.read_status(handoff_id)
+        if status is not None and status.get("state") == "running":
+            if not handoff_store.runner_alive(handoff_id):
+                handoff_store.write_status(
+                    handoff_id, "interrupted", "runner 进程已不存在"
+                )
+                status = handoff_store.read_status(handoff_id) or {
+                    "state": "interrupted",
+                    "note": "runner 进程已不存在",
+                }
         return status or {"state": "unknown", "note": "无此 handoff_id"}
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "failed", "note": str(exc)}
+
+
+@mcp.tool(
+    name="codex_handoff_cancel",
+    description="取消异步 Codex handoff；杀掉 runner 进程树并标记 interrupted，永不抛异常。",
+)
+async def codex_handoff_cancel(handoff_id: str) -> dict:
+    try:
+        pid = handoff_store.read_pid(handoff_id)
+        if pid is None:
+            status = handoff_store.read_status(handoff_id) or {}
+            return {
+                "state": status.get("state", "unknown"),
+                "note": "无运行中的 runner",
+            }
+        handoff_store.kill_runner(pid)
+        handoff_store.write_status(handoff_id, "interrupted", "已取消")
+        return {"handoff_id": handoff_id, "state": "interrupted"}
     except Exception as exc:  # noqa: BLE001
         return {"state": "failed", "note": str(exc)}
 

@@ -593,6 +593,10 @@ def env_bool(name: str, *, default: bool) -> bool:
     return default
 
 
+def max_async_handoffs() -> int:
+    return max(1, _env_int("CC_BRIDGE_MAX_ASYNC_HANDOFFS", 4))
+
+
 @dataclass
 class BridgeConfig:
     """跨 agent 调用的运行期配置。所有字段都可用环境变量覆盖。"""
