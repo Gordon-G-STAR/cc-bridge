@@ -268,7 +268,7 @@ def _kill_proc_tree(proc: "subprocess.Popen") -> None:
 
 
 def run_capture(
-    argv: list[str], *, timeout: int, extra_env: dict | None = None
+    argv: list[str], *, timeout: int, extra_env: dict | None = None, cwd: str | None = None
 ) -> CapturedRun:
     """像 ``subprocess.run(capture_output=True, timeout=...)`` 那样跑一条短命令，
     但在 Windows 上【真正有界、绝不挂死】：
@@ -294,6 +294,7 @@ def run_capture(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            cwd=cwd,
             **subprocess_creation_kwargs(),
         )
     except (OSError, ValueError):

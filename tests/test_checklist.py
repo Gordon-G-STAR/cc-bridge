@@ -134,6 +134,18 @@ async def test_check_item_command_reports_done_and_missing():
     assert fail.risk == "low"
 
 
+async def test_check_item_command_runs_in_project_dir(tmp_path):
+    # 回归:command 项必须在 project_dir(cwd) 里跑,而非 cc-bridge 进程的 cwd。
+    py = Path(sys.executable).as_posix()
+    r = await check_item(
+        ChecklistItem(f'{py} -c "open(\'made_here.txt\', \'w\').write(\'ok\')"', "command"),
+        str(tmp_path),
+        timeout=60,
+    )
+    assert r.status == "done"
+    assert (tmp_path / "made_here.txt").exists()  # 证明命令确实在 tmp_path 里执行
+
+
 def test_cmd_checklist_run_writes_report_and_returns_failure_for_missing(
     monkeypatch,
     tmp_path,

@@ -137,7 +137,7 @@ async def check_item(
 ) -> ItemResult:
     """顺序调用方使用的单项检查入口；调用者负责不要并发调度。"""
     if item.kind == "command":
-        run = config.run_capture(shlex.split(item.text), timeout=min(timeout, 120))
+        run = config.run_capture(shlex.split(item.text), timeout=min(timeout, 120), cwd=cwd)
         note = _decode_run_output(run.stdout, run.stderr)
         if not note:
             if run.timed_out:
