@@ -378,6 +378,20 @@ async def test_codex_execute_ctx_is_injected_not_input_schema():
     assert "dry_run" in codex_tool.inputSchema.get("properties", {})
 
 
+async def test_codex_handoff_exposes_input_and_output_schema():
+    """PR6:结构化委派的输入 / 输出 schema 都对 MCP Inspector 可见(版本化)。"""
+    from cc_bridge.bridge.mcp_to_codex import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    handoff = tools["codex_handoff"]
+    assert "request" in handoff.inputSchema.get("properties", {})
+    assert "HandoffRequest" in (handoff.inputSchema.get("$defs") or {})
+    assert "ctx" not in handoff.inputSchema.get("properties", {})
+    out = getattr(handoff, "outputSchema", None)
+    assert out is not None
+    assert "status" in (out.get("properties") or {})
+
+
 @pytest.fixture(autouse=True)
 def clear_audit_log_env(monkeypatch):
     monkeypatch.delenv("CC_BRIDGE_AUDIT_LOG", raising=False)

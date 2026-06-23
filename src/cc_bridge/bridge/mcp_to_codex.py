@@ -13,7 +13,6 @@ ContextBuilder -> AgentExecutor.run_codex -> ResultParser。
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from .executor import AgentExecutor
 from .handoff import authorize, execution_to_handoff, handoff_goal_text
 from .locks import LockBusy, async_project_lock
 from .parser import ResultParser
+from .progress import make_progress_callback as _make_progress_callback
 from .status import check_codex
 
 mcp = FastMCP("bridge-to-codex")
@@ -93,35 +93,6 @@ def _remember_codex_session(cwd: str, session_id: str) -> None:
 
 def _mark_dry_run_summary(summary: str) -> str:
     return f"{_DRY_RUN_SUMMARY_PREFIX}{summary}"
-
-
-def _make_progress_callback(ctx: Context | None):
-    """把 executor 的进度标签转成 MCP progress/info；任何异常都静默降级。"""
-    if ctx is None:
-        return None
-    state = {"count": 0, "last_message": "", "last_at": 0.0}
-
-    async def _on_progress(message: str) -> None:
-        try:
-            text = " ".join(str(message).split())
-            if not text or text == state["last_message"]:
-                return
-            now = time.monotonic()
-            if state["count"] and now - state["last_at"] < 0.25:
-                return
-            if len(text) > 240:
-                text = text[:237] + "..."
-            state["count"] += 1
-            state["last_message"] = text
-            state["last_at"] = now
-            await ctx.report_progress(
-                progress=float(state["count"]), total=None, message=text
-            )
-            await ctx.info(text)
-        except Exception:
-            pass
-
-    return _on_progress
 
 
 @mcp.tool(
