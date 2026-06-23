@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
+from pathlib import Path
 
 from cc_bridge import __version__
 
@@ -144,6 +146,47 @@ def cmd_version(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_checklist_run(args: argparse.Namespace) -> int:
+    from cc_bridge import checklist
+    from cc_bridge.bridge.context import require_project_dir
+
+    try:
+        project_dir = require_project_dir(args.project_dir)
+    except ValueError as exc:
+        print(f"project_dir 错误：{exc}", file=sys.stderr)
+        return 2
+
+    try:
+        checklist_text = Path(args.checklist).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"读取 checklist 失败：{exc}", file=sys.stderr)
+        return 2
+
+    items = checklist.parse_checklist(checklist_text)
+    results = asyncio.run(
+        checklist.run_checklist(
+            items,
+            project_dir,
+            agent=args.agent,
+            timeout=args.timeout,
+        )
+    )
+    report = checklist.render_report(project_dir, results)
+
+    if args.report:
+        try:
+            Path(args.report).write_text(report, encoding="utf-8")
+        except OSError as exc:
+            print(f"写入报告失败：{exc}", file=sys.stderr)
+            return 2
+    else:
+        print(report, end="")
+
+    if any(result.status in {"missing", "error"} or result.risk == "high" for result in results):
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cc-bridge", description="Claude x Codex 自动协作桥")
     sub = parser.add_subparsers(dest="command")
@@ -170,6 +213,19 @@ def build_parser() -> argparse.ArgumentParser:
         "selftest", help="启动自检：拉起 <launcher> --mcp-server 做一次 MCP 握手"
     ).set_defaults(func=cmd_selftest)
     sub.add_parser("version", help="打印版本").set_defaults(func=cmd_version)
+
+    p_checklist = sub.add_parser("checklist-run", help="逐项短调用执行验收清单")
+    p_checklist.add_argument("--checklist", required=True, help="验收清单 Markdown 文件")
+    p_checklist.add_argument("--project-dir", required=True, help="项目绝对路径")
+    p_checklist.add_argument(
+        "--agent",
+        choices=["claude", "codex"],
+        default="claude",
+        help="语义项检查使用的 agent",
+    )
+    p_checklist.add_argument("--report", help="报告输出路径；不传则打印到 stdout")
+    p_checklist.add_argument("--timeout", type=int, default=300, help="每项超时秒数")
+    p_checklist.set_defaults(func=cmd_checklist_run)
 
     return parser
 

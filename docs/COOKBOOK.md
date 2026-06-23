@@ -124,6 +124,8 @@ cc-bridge install \
 
 上面是通用代码开发;下面是把 cc-bridge 用在**真实项目验收 / Demo 交付**上的配方。共同套路:**Claude 对照清单/规格做只读审查(`dry_run`)→ 列差距和证据 → 需要补齐时再让 Codex 落地(`git_mode="safe"`)**。都用现有工具;清单长就**逐项短调用**(一项一调,避免单次长任务超时)。
 
+> 想把整份清单自动化:`cc-bridge checklist-run --checklist X.md --project-dir Y`(见 [`CONFIG.md`](CONFIG.md))——它就是把下面这套逐项短调用打包成一条命令:`- 描述` 让 agent 只读检查、`- [cmd] 命令` 跑命令(退出 0=过),输出 已完成/部分/未完成/高风险/建议关注文件 的分组报告。
+
 ## A. 合同功能差距检查
 逐条对照需求清单看代码实现了没。在 **Codex** 里让 Claude 审:
 

@@ -28,6 +28,12 @@ cc-bridge install    # 写配置(--no-test / --force 可选)
                      #   --audit-log <文件路径>        开启审计日志
 cc-bridge uninstall  # 移除配置
 cc-bridge version
+cc-bridge checklist-run --checklist <file> --project-dir <abs>
+                     # 逐项跑验收清单(每项一次短调用,在本进程内直接调,不经 MCP 故不超时):
+                     #   `- 描述`       让 agent 只读检查该项 → done/partial/missing + 风险 + 涉及文件
+                     #   `- [cmd] 命令` 跑命令,退出码 0=过
+                     # 输出分组报告(已完成/部分/未完成/错误/高风险/建议关注文件);
+                     # --report 写文件、--agent claude|codex(默认 claude)、--timeout 每项秒数
 ```
 
 ## 环境变量
