@@ -70,7 +70,7 @@ class Configurator:
     """读写 Claude 桌面版与 Codex 的 MCP 配置。"""
 
     # -- Claude Desktop（JSON）-------------------------------------------
-    def register_in_claude_desktop(self) -> ConfigChange:
+    def register_in_claude_desktop(self, env: dict[str, str] | None = None) -> ConfigChange:
         path = config.claude_desktop_config_path()
         target = "Claude Desktop"
         try:
@@ -141,7 +141,13 @@ class Configurator:
             new_entry = dict(existing) if isinstance(existing, dict) else {}
             new_entry["command"] = command
             new_entry["args"] = args
-            new_entry.setdefault("env", {})
+            # 保留用户已有的 env；只有当它确实是 dict 时才合并，否则从空起步——
+            # 避免用户把 env 写成非 dict（如字符串/列表）时 dict() 抛 TypeError 逃逸出
+            # 本方法的 OSError 兜底（本文件约定：绝不向上抛异常）。
+            existing_env = existing.get("env") if isinstance(existing, dict) else None
+            base_env = dict(existing_env) if isinstance(existing_env, dict) else {}
+            base_env.update(env or {})
+            new_entry["env"] = base_env
             already_present = existing == new_entry
 
             if not already_present:
@@ -169,7 +175,7 @@ class Configurator:
             )
 
     # -- Codex（TOML，追加注释包裹块）-----------------------------------
-    def register_in_codex(self) -> ConfigChange:
+    def register_in_codex(self, env: dict[str, str] | None = None) -> ConfigChange:
         path = config.codex_config_path()
         target = "Codex"
         try:
@@ -223,7 +229,7 @@ class Configurator:
                     config_path=str(path),
                     message=f"无法确定 MCP server 的启动命令：{exc}",
                 )
-            new_block = _build_codex_block(command, args)
+            new_block = _build_codex_block(command, args, env)
 
             # 用户自己注册了同名 section（没有我们的标记）：尊重它，不覆盖。
             if section_present and not has_marker:
@@ -410,9 +416,9 @@ class Configurator:
             )
 
     # -- 批量 -------------------------------------------------------------
-    def register_all(self) -> list:
+    def register_all(self, env: dict[str, str] | None = None) -> list:
         """注册全部，顺序为 [Claude Desktop, Codex]。"""
-        return [self.register_in_claude_desktop(), self.register_in_codex()]
+        return [self.register_in_claude_desktop(env=env), self.register_in_codex(env=env)]
 
     def unregister_all(self) -> list:
         """卸载全部，顺序为 [Claude Desktop, Codex]。"""
@@ -454,14 +460,23 @@ def _extract_codex_block(text: str) -> str:
     return text[begin : end + len(_CODEX_MARKER_END)]
 
 
-def _build_codex_block(command: str, args: list[str]) -> str:
+def _build_codex_block(
+    command: str, args: list[str], env: dict[str, str] | None = None
+) -> str:
     """拼出带注释标记的 Codex MCP 注册块（以换行结尾）。"""
     args_literals = ", ".join(_toml_literal_string(a) for a in args)
+    env_line = ""
+    if env:
+        env_literals = ", ".join(
+            f"{key} = {_toml_literal_string(str(value))}" for key, value in env.items()
+        )
+        env_line = f"env = {{ {env_literals} }}\n"
     return (
         f"{_CODEX_MARKER_BEGIN}\n"
         f"[mcp_servers.{_CODEX_SERVER_KEY}]\n"
         f"command = {_toml_literal_string(command)}\n"
         f"args = [{args_literals}]\n"
+        f"{env_line}"
         f"{_CODEX_MARKER_END}\n"
     )
 
