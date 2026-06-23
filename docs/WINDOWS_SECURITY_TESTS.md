@@ -21,11 +21,11 @@ pytest -m "not integration"           # 全平台;Windows 专属项在 windows-l
 | clean-filter / autocrlf 哈希分歧 | `test_snapshot.py::test_sha256_file_hashes_raw_bytes_without_newline_normalization` | 哈希磁盘原始字节,绕开 filter / 行尾归一 | ✅ 全平台 | 已验证:哈希不做行尾归一 |
 | 进程树静默 + 全链杀(Job Object) | `test_jobobject.py::test_jobobject_kills_assigned_child_on_exit` | Windows Job Object 真实 | ✅ windows-latest | 已验证:assigned child 在 job 关闭时被杀 |
 | 符号链接逃逸 | `test_scope.py`(POSIX 分支) | POSIX 真实符号链接(Windows 建符号链接需管理员,改由 junction 覆盖 reparse) | ✅ ubuntu / macos | 已验证(POSIX);Windows reparse 由 junction 用例覆盖 |
-| **detached 孙进程「快照后写」时序** | — | 机制(进程树静默 + Job Object 全链杀)已测;但「孙进程在快照取完后再写盘」这一**端到端时序竞态**尚无专门 PoC | ⚠️ **部分** | **未单独验证**:杀进程树的机制在位,但该竞态的端到端 PoC 待补 |
+| **detached 孙进程「快照后写」时序** | `test_jobobject.py::test_jobobject_kills_grandchild_no_write_after_snapshot` | P 被 assign 进 job 后才 spawn 孙进程 G;G 写 `g_started` 证明在 job 内,sleep 后试图"快照后写";job 关闭杀整树 | ✅ windows-latest | 已验证(Windows):孙进程被 Job Object 杀,`g_leaked` 永不写出。**POSIX 无 Job Object(noop)** —— 靠 `killpg` 杀进程组,但仅在超时/取消时;正常完成下脱离会话组的孙进程不被杀,是已知 gap(见下) |
 
 ## 仍待补(诚实清单)
 
-- **detached-孙进程「快照后写」端到端 PoC** —— 见上表最后一行。
+- **POSIX 下 detached 孙进程的进程树静默** —— Windows 由 Job Object 兜底(已验证);POSIX 无 Job Object,正常完成路径下脱离会话组(`setsid`)的孙进程不被杀。需补 POSIX 侧的进程组 / cgroup 兜底。
 - **PR4 的 WAL + 逐文件回滚** —— 未做;有改动的成功 handoff 一律标 `detected_but_not_reverted`(见 [`v0.2-roadmap.md`](v0.2-roadmap.md) 的「实现状态」)。
 
-> 一句话:Windows 路径形态(硬链接 / junction / ADS / 保留名)与 skip-worktree / filter 哈希、Job Object 全链杀都已在 `windows-latest` CI 实跑验证;唯一未单独验证的是 detached-孙进程的「快照后写」时序竞态,以及 PR4 回滚。
+> 一句话:Windows 路径形态(硬链接 / junction / ADS / 保留名)、skip-worktree / filter 哈希、Job Object 全链杀、**以及 detached 孙进程「快照后写」** 都已在 `windows-latest` CI 实跑验证;剩 POSIX 侧孙进程兜底与 PR4 回滚。
