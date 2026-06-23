@@ -1,0 +1,10 @@
+{
+  "contract_version": "1",
+  "goal": "给 add() 补边界用例",
+  "acceptance_criteria": ["pytest 通过"],
+  "requested_scope": {
+    "writable_paths": ["tests"],
+    "network": "deny",
+    "check_ids": []
+  }
+}

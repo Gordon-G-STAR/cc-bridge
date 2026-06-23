@@ -27,9 +27,18 @@ cc-bridge install      # 然后重启 Claude 和 Codex
 - `project_dir` 要传**绝对路径**;两个工具都可带 `continue_session=True` 接着上一轮会话。
 - 每次调用都回一份**标准化报告**:调用方向、项目、任务、改动文件、下一步建议、耗时。
 - 想让改动可控:传 `git_mode="safe"`,改动会被隔离到临时分支、跑完提交并切回原分支,原分支不受影响。
-- 需要结构化委派(申请权限范围 / 验收标准)时用 v0.2 的 `codex_handoff` / `claude_handoff`。
+- 需要权限可控、可审计的委派时用 v0.2 的结构化合同工具 `codex_handoff` / `claude_handoff`(申请权限范围 + 验收标准,本地策略重授权)。两类工具对照:
+
+| 工具 | 定位 | 适合 |
+| --- | --- | --- |
+| `codex_execute` / `claude_analyze` | legacy 自由文本 | 简单任务、快速评审、日常迭代 |
+| `codex_handoff` / `claude_handoff` | v0.2 结构化合同 | 需要权限可控 / 可审计的委派 |
+
+> handoff 现状限制(诚实说):同步 MCP 长任务会撞客户端超时(`-32001`,异步通道待 MCP SDK v2 Tasks);回滚是「检测不补」(成功但有改动会标 `detected_but_not_reverted`)。**长任务目前更稳的是 legacy + `git_mode="safe"`。** 可运行示例见 [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/)。
 
 ## 注意
+
+**先说清边界:cc-bridge 是「检测 + 补救」,不是容器沙箱。** 它限定可操作范围、检测越界并标记/记录、部分场景尝试补救;但底层 agent 或系统若绕过限制它拦不住——别拿它替代系统级隔离(容器 / VM / 受限账户)。
 
 默认对方能在那个目录里自动改文件、跑命令,**不会问你**。几道安全带:
 
@@ -64,9 +73,18 @@ In Claude: "design this change, then have Codex implement it and run the tests u
 - `project_dir` must be absolute; both tools take `continue_session=True` to resume the last session.
 - Every call returns a **standardized report**: direction, project, task, files changed, next-step suggestion, duration.
 - Want changes contained? Pass `git_mode="safe"` — work is isolated on a temp branch, committed there, then the original branch is restored untouched.
-- For structured delegation (requested scope / acceptance criteria) use v0.2's `codex_handoff` / `claude_handoff`.
+- For permission-controlled, auditable delegation use v0.2's structured-contract tools `codex_handoff` / `claude_handoff` (requested scope + acceptance criteria, re-authorized by local policy). Quick guide:
+
+| Tool | What | When |
+| --- | --- | --- |
+| `codex_execute` / `claude_analyze` | legacy free-text | simple tasks, quick reviews, daily iteration |
+| `codex_handoff` / `claude_handoff` | v0.2 structured contract | when you need controlled / auditable scope |
+
+> Honest limits today: synchronous MCP times out on long handoffs (`-32001`; async awaits MCP SDK v2 Tasks), and rollback is "detect, not revert" (a successful handoff with changes is marked `detected_but_not_reverted`). **For long tasks, legacy + `git_mode="safe"` is currently more reliable.** Runnable example: [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/).
 
 ### Heads up
+
+**Scope first: cc-bridge is "detect + remediate", not a container sandbox.** It fences the reachable range, detects and records boundary violations, and remediates in some cases — but it cannot stop a determined agent or the OS from going around it. Don't use it instead of system-level isolation (container / VM / restricted account).
 
 By default the other agent edits files and runs commands in that directory without asking. A few safety belts:
 
