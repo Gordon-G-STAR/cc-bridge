@@ -6,9 +6,9 @@ README 只放最常用的,完整参考在这里。
 
 | 工具 | 装在 | 参数 |
 | --- | --- | --- |
-| `codex_execute` | Claude | `task`、`project_dir`(绝对路径,必填)、`continue_session`(续接上次会话)、`dry_run`(预演,只分析不改文件)、`git_mode`(`"safe"`=把改动隔离到临时分支) |
+| `codex_execute` | Claude | `task`、`project_dir`(绝对路径,必填)、`continue_session`(续接上次会话)、`dry_run`(预演,只分析不改文件)、`git_mode`(`"safe"`=把改动隔离到临时分支)、`timeout_seconds`(单次超时秒,10–1800) |
 | `codex_status` | Claude | 无 |
-| `claude_analyze` | Codex | `task`、`project_dir`(绝对路径,必填)、`continue_session`、`dry_run`、`git_mode` |
+| `claude_analyze` | Codex | `task`、`project_dir`(绝对路径,必填)、`continue_session`、`dry_run`、`git_mode`、`timeout_seconds` |
 | `claude_status` | Codex | 无 |
 | `codex_handoff_async`/`_status`/`_result`/`_cancel` | Claude | 异步结构化委派给 Codex(见下「异步 handoff」) |
 | `claude_handoff_async`/`_status`/`_result`/`_cancel` | Codex | 异步结构化委派给 Claude(见下「异步 handoff」) |
@@ -16,6 +16,13 @@ README 只放最常用的,完整参考在这里。
 `project_dir` 必须是存在的绝对路径,缺失 / 相对路径 / 不存在都会被拒绝。
 
 `git_mode="safe"` 要求当前是【干净】的 git 仓库(具名分支、已有提交、无未提交改动):它把对方改动隔离到临时分支 `cc-bridge/<时间戳>`,跑完提交到该分支并切回原分支,使原分支**不受影响**;不满足前置条件会在动手前拒绝,返回的报告里带查看 / 对比 / 合并 / 丢弃该分支的命令。`dry_run` 下忽略 `git_mode`。(`git_mode` 仅作用于 legacy 的 `codex_execute` / `claude_analyze`;结构化 `*_handoff` 走自己的 evidence/scope 机制。)
+
+## 长任务 / 超时怎么选
+
+- **短任务**:默认即可(`CC_BRIDGE_TIMEOUT`,默认 300s)。
+- **中长任务**:legacy 工具传 `timeout_seconds`(10–1800),把单次超时调大,避免仍在跑的对方被默认 300s 切断(切断只拿到部分结果)。
+- **超长 / 不想阻塞 / 要可取消**:用下面的**异步 handoff**——执行在独立后台进程,合同 `timeout_seconds` 最高 1800s,不撞 MCP `-32001`,可 `cancel`。
+- **对方 CLI 本身就慢**:例如 Codex 的 `~/.codex` 开了 `reasoning effort: xhigh` + 加载大量 skills,光启动就 ~50s+,再叠加任务本身很容易超 300s。这是**宿主侧全局配置**——调低 effort / 精简损坏的 skills 能显著提速;属你自己的 `~/.codex`,cc-bridge 不擅自改。
 
 ## 异步 handoff
 

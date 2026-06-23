@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cc-bridge"
-version = "0.3.0"
+version = "0.3.1"
 description = "Claude x Codex auto-collaboration bridge — let Claude Desktop call Codex and vice versa, using subscription quota (no API keys)."
 readme = "README.md"
 requires-python = ">=3.11"

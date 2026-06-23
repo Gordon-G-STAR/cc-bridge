@@ -77,6 +77,23 @@ def clear_codex_session_cache():
     mcp_to_codex._CODEX_SESSION_LOCKS_BY_PROJECT.clear()
 
 
+async def test_codex_execute_timeout_seconds_passed_and_clamped(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    async def _fake_run_codex(self, prompt, cwd, **kwargs):
+        calls.append(kwargs)
+        return ExecutionResult(success=True, output="ok", duration_seconds=1.0)
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake_run_codex)
+
+    await mcp_to_codex.codex_execute("t", project_dir=str(tmp_path), timeout_seconds=900)
+    assert calls[0]["timeout"] == 900
+
+    calls.clear()
+    await mcp_to_codex.codex_execute("t", project_dir=str(tmp_path), timeout_seconds=99999)
+    assert calls[0]["timeout"] == 1800  # 夹到上限
+
+
 async def test_codex_execute_success(monkeypatch, tmp_path):
     _patch_run_codex(
         monkeypatch,

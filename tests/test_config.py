@@ -344,6 +344,14 @@ def test_resolve_cli_falls_back_to_common_dirs(monkeypatch, tmp_path):
     assert config.resolve_cli("weirdcli") == str(tool)
 
 
+def test_clamp_call_timeout():
+    assert config.clamp_call_timeout(None) is None          # 用默认 CC_BRIDGE_TIMEOUT
+    assert config.clamp_call_timeout(900) == 900
+    assert config.clamp_call_timeout(5) == config.MIN_CALL_TIMEOUT      # 下限
+    assert config.clamp_call_timeout(99999) == config.MAX_CALL_TIMEOUT  # 上限
+    assert config.clamp_call_timeout("not-an-int") is None             # 非法→默认
+
+
 # ---------------------------------------------------------------------------
 # run_capture / git_capture：硬化短命令执行（真有界、不挂死、stdin 隔离）
 # ---------------------------------------------------------------------------

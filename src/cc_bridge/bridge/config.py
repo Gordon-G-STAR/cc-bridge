@@ -597,6 +597,22 @@ def max_async_handoffs() -> int:
     return max(1, _env_int("CC_BRIDGE_MAX_ASYNC_HANDOFFS", 4))
 
 
+# legacy 工具 per-call 超时的边界(秒):下限防误填过小、上限防无界挂死。
+MIN_CALL_TIMEOUT = 10
+MAX_CALL_TIMEOUT = 1800
+
+
+def clamp_call_timeout(seconds: int | None) -> int | None:
+    """把调用方传入的 per-call 超时夹到 [10, 1800] 秒;None=沿用默认 CC_BRIDGE_TIMEOUT。"""
+    if seconds is None:
+        return None
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    return max(MIN_CALL_TIMEOUT, min(MAX_CALL_TIMEOUT, seconds))
+
+
 @dataclass
 class BridgeConfig:
     """跨 agent 调用的运行期配置。所有字段都可用环境变量覆盖。"""

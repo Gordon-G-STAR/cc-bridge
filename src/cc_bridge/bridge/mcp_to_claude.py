@@ -112,7 +112,8 @@ def _mark_dry_run_summary(summary: str) -> str:
         "- continue_session：传 true 续接该项目上一次的 Claude 会话（多轮接力）。\n"
         "- dry_run：传 true 进入预演——Claude 只分析、说清会改什么，不真正改文件（plan 模式）。\n"
         "- git_mode：传 \"safe\" 时把改动隔离到临时分支，跑完提交到该分支并切回原分支，"
-        "使原分支不受影响（要求干净的 git 工作区）。默认 \"off\"。\n\n"
+        "使原分支不受影响（要求干净的 git 工作区）。默认 \"off\"。\n"
+        "- timeout_seconds：单次调用超时秒数（10–1800）；长任务调大可避免默认 300s 把仍在跑的 Claude 切断。\n\n"
         "适用场景：架构/代码评审、疑难 bug 的根因分析、方案设计与取舍建议。"
         "返回值是 Claude 处理结果的自然语言摘要（含成功与否、改动的文件列表、说明）。"
     ),
@@ -123,6 +124,7 @@ async def claude_analyze(
     continue_session: bool = False,
     dry_run: bool = False,
     git_mode: str = "off",
+    timeout_seconds: int | None = None,
     ctx: Context = None,
 ) -> str:
     """让 Claude 在 ``project_dir`` 里处理 ``task``，返回结果摘要字符串。
@@ -173,6 +175,7 @@ async def claude_analyze(
                     _DRY_RUN_CLAUDE_PERMISSION_MODE if dry_run else legacy.engine_mode
                 ),
                 "extra_env": legacy.child_env,
+                "timeout": config.clamp_call_timeout(timeout_seconds),
             }
             result = await AgentExecutor(cfg).run_claude(prompt, cwd, **run_kwargs)
             if result.session_id:
