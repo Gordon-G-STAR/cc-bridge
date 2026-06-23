@@ -111,6 +111,75 @@ def test_build_parser_install_flags():
     assert args.force is True
 
 
+def test_install_passes_safety_env_to_configurator(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "cc_bridge.installer.detector.EnvironmentDetector.check_all",
+        lambda self: _status(True, True),
+    )
+
+    def _register_all(self, env=None):
+        captured["env"] = env
+        return [
+            argparse.Namespace(
+                target="Claude Desktop", success=True, already_present=False, message="ok"
+            ),
+            argparse.Namespace(target="Codex", success=True, already_present=False, message="ok"),
+        ]
+
+    monkeypatch.setattr(
+        "cc_bridge.installer.configurator.Configurator.register_all", _register_all
+    )
+
+    rc = cli.main(
+        [
+            "install",
+            "--no-test",
+            "--allowed-roots",
+            "X",
+            "--codex-sandbox",
+            "read-only",
+            "--audit-log",
+            "Y",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["env"] == {
+        "CC_BRIDGE_ALLOWED_ROOTS": "X",
+        "CC_BRIDGE_CODEX_SANDBOX": "read-only",
+        "CC_BRIDGE_AUDIT_LOG": "Y",
+    }
+
+
+def test_install_without_safety_flags_passes_no_env(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "cc_bridge.installer.detector.EnvironmentDetector.check_all",
+        lambda self: _status(True, True),
+    )
+
+    def _register_all(self, env=None):
+        captured["env"] = env
+        return [
+            argparse.Namespace(
+                target="Claude Desktop", success=True, already_present=False, message="ok"
+            ),
+            argparse.Namespace(target="Codex", success=True, already_present=False, message="ok"),
+        ]
+
+    monkeypatch.setattr(
+        "cc_bridge.installer.configurator.Configurator.register_all", _register_all
+    )
+
+    rc = cli.main(["install", "--no-test"])
+
+    assert rc == 0
+    assert captured["env"] is None
+
+
 def _selftest_result(success: bool, host: str):
     from cc_bridge.installer.mcp_selftest import McpSelfTestResult
 

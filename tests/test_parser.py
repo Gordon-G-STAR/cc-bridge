@@ -235,6 +235,105 @@ def test_summarize_short_summary_not_truncated(make_execution_result):
     assert "短短的输出" in text
 
 
+def test_summarize_report_header_with_context(make_execution_result):
+    result = make_execution_result(success=True, output="ok", files_changed=["src/foo.py"])
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(
+        parsed,
+        "codex",
+        caller="claude",
+        project_dir="C:/repo/demo",
+        task="实现标准化报告头",
+    )
+
+    assert "【cc-bridge 报告】Claude → Codex" in text
+    assert "项目：C:/repo/demo" in text
+    assert "任务：实现标准化报告头" in text
+
+
+def test_summarize_next_step_success_with_files(make_execution_result):
+    result = make_execution_result(success=True, output="ok", files_changed=["src/foo.py"])
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(parsed, "codex", caller="claude")
+
+    assert "下一步：" in text
+    assert "复核改动" in text
+
+
+def test_summarize_next_step_success_without_files(make_execution_result):
+    result = make_execution_result(success=True, output="ok", files_changed=[])
+    parser = ResultParser()
+    parsed = parser.parse(result, "claude")
+
+    text = parser.summarize_for_caller(parsed, "claude", caller="codex")
+
+    assert "下一步：" in text
+    assert "据此结论继续" in text
+
+
+def test_summarize_next_step_quota_failure(make_execution_result):
+    result = make_execution_result(
+        success=False, output="", raw_stderr="rate limit", error="failed", exit_code=1
+    )
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(parsed, "codex", caller="claude")
+
+    assert "下一步：" in text
+    assert "额度/限流状态" in text
+
+
+def test_summarize_next_step_auth_failure(make_execution_result):
+    result = make_execution_result(
+        success=False, output="", error="not logged in", exit_code=1
+    )
+    parser = ResultParser()
+    parsed = parser.parse(result, "claude")
+
+    text = parser.summarize_for_caller(parsed, "claude", caller="codex")
+
+    assert "下一步：" in text
+    assert "完成登录后重试" in text
+
+
+def test_summarize_next_step_timeout_failure(make_execution_result):
+    result = make_execution_result(
+        success=False, output="partial", timed_out=True, error="timeout", exit_code=None
+    )
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(parsed, "codex", caller="claude")
+
+    assert "下一步：" in text
+    assert "调高 CC_BRIDGE_TIMEOUT" in text
+
+
+def test_summarize_without_new_context_is_backward_compatible(make_execution_result):
+    result = make_execution_result(success=True, output="ok")
+    parser = ResultParser()
+    parsed = parser.parse(result, "codex")
+
+    text = parser.summarize_for_caller(parsed, "codex")
+
+    assert "【cc-bridge 报告】" not in text
+    assert "下一步" not in text
+
+
+def test_short_task_truncates_to_120_chars():
+    task = "x" * 200
+
+    shortened = ResultParser._short_task(task)
+
+    assert len(shortened) <= 120
+    assert shortened.endswith("…")
+
+
 def test_parsed_result_dataclass_shape(make_execution_result):
     result = make_execution_result(
         success=True,

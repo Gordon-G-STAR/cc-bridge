@@ -145,6 +145,19 @@ def test_resolve_flags_reserved_and_ads_lexically(tmp_path):
     assert resolve_within_root("src/auth/x.py", str(tmp_path)).taints == ()
 
 
+def test_directory_not_flagged_hardlink_aliased(tmp_path):
+    """目录 st_nlink 天然 >= 2(自身 "." + 各子目录回指 ".."),不能被误判为硬链接别名;
+    申请路径叶子不存在时会上溯到目录祖先,同样不该误标。
+
+    这是 macOS/Linux 上 test_resolve_flags_reserved_and_ads_lexically 误红的根因回归
+    (Windows 目录 nlink 常报 1,本就不显形)。
+    """
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    assert "hardlink_aliased" not in path_taints(sub)
+    assert resolve_within_root("a/b/c.py", str(tmp_path)).taints == ()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="NTFS 硬链接(os.link,无需管理员)")
 def test_hardlink_detected_on_windows(tmp_path):
     real = tmp_path / "real.txt"

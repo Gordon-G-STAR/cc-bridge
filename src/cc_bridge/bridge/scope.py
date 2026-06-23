@@ -150,8 +150,16 @@ def path_taints(path) -> list[str]:
         taints.append("reserved_name")
     if is_dotgit_path(p):
         taints.append("dotgit")
-    nlink = hardlink_count(path)
-    if nlink is not None and nlink > 1:
+    # 硬链接别名检测只对【普通文件】有意义:目录的 st_nlink 天然 >= 2(自身 "." 加上
+    # 每个子目录回指的 ".."),在 Linux/macOS 上会把任意目录误判为 hardlink_aliased
+    # (Windows 上目录 nlink 常报 1,故不显形)。resolve_within_root 在叶子尚不存在时会
+    # 上溯到最近的存在祖先(往往是目录),若不加 S_ISREG 守卫,任何"目标还不存在"的申请
+    # 路径都会被误标——这正是跨平台 CI 在 macOS/Linux 上一直红的根因。
+    try:
+        st = os.stat(path)
+    except OSError:
+        st = None
+    if st is not None and stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
         taints.append("hardlink_aliased")
     tag = reparse_tag(path)
     if tag is not None:

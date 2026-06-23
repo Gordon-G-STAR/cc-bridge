@@ -246,6 +246,82 @@ def test_register_claude_no_write_when_unchanged_keeps_env(patched_paths):
     assert entry["env"] == {"CC_BRIDGE_TIMEOUT": "600"}
 
 
+def test_register_claude_merges_safety_env_and_preserves_user_env(patched_paths):
+    claude_path, _codex = patched_paths
+    claude_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd, args = config.mcp_launch_command(_CLAUDE_SERVER_MODULE)
+    claude_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    _CLAUDE_SERVER_KEY: {
+                        "command": cmd,
+                        "args": args,
+                        "env": {"USER_KEY": "keep", "CC_BRIDGE_TIMEOUT": "600"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    change = Configurator().register_in_claude_desktop(
+        env={"CC_BRIDGE_ALLOWED_ROOTS": "C:/repo", "CC_BRIDGE_TIMEOUT": "900"}
+    )
+
+    assert change.success
+    entry = json.loads(claude_path.read_text(encoding="utf-8"))["mcpServers"][_CLAUDE_SERVER_KEY]
+    assert entry["env"] == {
+        "USER_KEY": "keep",
+        "CC_BRIDGE_TIMEOUT": "900",
+        "CC_BRIDGE_ALLOWED_ROOTS": "C:/repo",
+    }
+
+
+def test_register_claude_tolerates_non_dict_existing_env(patched_paths):
+    """已存在记录的 env 被用户写成非 dict（如字符串）时，写安全 env 不能抛异常：
+    应从空 env 起步合并新键，绝不让 dict() 的 TypeError 逃出本方法的 OSError 兜底。"""
+    claude_path, _codex = patched_paths
+    claude_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd, args = config.mcp_launch_command(_CLAUDE_SERVER_MODULE)
+    claude_path.write_text(
+        json.dumps({"mcpServers": {_CLAUDE_SERVER_KEY: {
+            "command": cmd, "args": args, "env": "not-a-dict"}}}),
+        encoding="utf-8",
+    )
+
+    change = Configurator().register_in_claude_desktop(
+        env={"CC_BRIDGE_AUDIT_LOG": "C:/log"}
+    )
+
+    assert change.success
+    entry = json.loads(claude_path.read_text(encoding="utf-8"))["mcpServers"][_CLAUDE_SERVER_KEY]
+    assert entry["env"] == {"CC_BRIDGE_AUDIT_LOG": "C:/log"}
+
+
+def test_register_codex_writes_env_block_with_literal_windows_path(patched_paths):
+    _claude_path, codex_path = patched_paths
+
+    change = Configurator().register_in_codex(
+        env={"CC_BRIDGE_ALLOWED_ROOTS": r"C:\Users\me\repo"}
+    )
+
+    assert change.success
+    text = codex_path.read_text(encoding="utf-8")
+    assert "env = {" in text
+    assert "CC_BRIDGE_ALLOWED_ROOTS = 'C:\\Users\\me\\repo'" in text
+
+
+def test_register_without_env_keeps_default_env_shape(patched_paths):
+    claude_path, codex_path = patched_paths
+
+    Configurator().register_all()
+
+    entry = json.loads(claude_path.read_text(encoding="utf-8"))["mcpServers"][_CLAUDE_SERVER_KEY]
+    assert entry["env"] == {}
+    assert "env = {" not in codex_path.read_text(encoding="utf-8")
+
+
 def test_atomic_write_cleans_tmp_on_replace_failure(tmp_path, monkeypatch):
     """os.replace 失败（如桌面应用占用文件）时不得残留 .cc-bridge.tmp。"""
     from cc_bridge.installer import configurator as cfg

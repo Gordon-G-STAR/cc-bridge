@@ -64,8 +64,16 @@ def cmd_install(args: argparse.Namespace) -> int:
         print("\n检测未全部通过。如确认无误，可加 --force 强制写入配置。")
         return 1
 
+    install_env = {}
+    if args.allowed_roots is not None:
+        install_env["CC_BRIDGE_ALLOWED_ROOTS"] = args.allowed_roots
+    if args.codex_sandbox is not None:
+        install_env["CC_BRIDGE_CODEX_SANDBOX"] = args.codex_sandbox
+    if args.audit_log is not None:
+        install_env["CC_BRIDGE_AUDIT_LOG"] = args.audit_log
+
     print("\n注册桥接插件：")
-    changes = Configurator().register_all()
+    changes = Configurator().register_all(env=install_env or None)
     ok = True
     for change in changes:
         mark = "✅" if change.success else "❌"
@@ -74,6 +82,8 @@ def cmd_install(args: argparse.Namespace) -> int:
         ok = ok and change.success
     if not ok:
         return 1
+    if install_env:
+        print("已写入安全配置：" + ", ".join(install_env))
 
     if not args.no_test:
         print("\nMCP 启动自检：")
@@ -145,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_install = sub.add_parser("install", help="写入桥接 MCP 配置")
     p_install.add_argument("--no-test", action="store_true", help="跳过连通性测试")
     p_install.add_argument("--force", action="store_true", help="检测未通过也强制写入")
+    p_install.add_argument("--allowed-roots", help="写入 CC_BRIDGE_ALLOWED_ROOTS")
+    p_install.add_argument(
+        "--codex-sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        help="写入 CC_BRIDGE_CODEX_SANDBOX",
+    )
+    p_install.add_argument("--audit-log", help="写入 CC_BRIDGE_AUDIT_LOG")
     p_install.set_defaults(func=cmd_install)
 
     sub.add_parser("uninstall", help="移除桥接 MCP 配置").set_defaults(func=cmd_uninstall)

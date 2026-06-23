@@ -116,10 +116,27 @@ class ResultParser:
         parsed: ParsedResult,
         agent: str,
         max_length: int = DEFAULT_MAX_OUTPUT_CHARS,
+        *,
+        caller: str | None = None,
+        project_dir: str | None = None,
+        task: str | None = None,
     ) -> str:
         """把 ParsedResult 渲染成一段紧凑的文本，返回给调用方 agent。"""
-        agent_name = "Claude" if agent == "claude" else "Codex"
+        agent_name = self._agent_name(agent)
         lines: list[str] = []
+
+        header_lines: list[str] = []
+        if caller is not None:
+            header_lines.append(
+                f"【cc-bridge 报告】{self._agent_name(caller)} → {agent_name}"
+            )
+        if project_dir is not None:
+            header_lines.append(f"项目：{project_dir}")
+        if task is not None:
+            header_lines.append(f"任务：{self._short_task(task)}")
+        if header_lines:
+            lines.extend(header_lines)
+            lines.append("")
 
         if parsed.success:
             lines.append(f"✅ {agent_name} 已完成任务。")
@@ -128,6 +145,10 @@ class ResultParser:
             hint = self._failure_hint(agent_name, parsed.failure_kind)
             if hint:
                 lines.append(hint)
+
+        if caller is not None:
+            lines.append("")
+            lines.append(self._next_step(parsed))
 
         if parsed.files_changed:
             shown = parsed.files_changed[:20]
@@ -165,6 +186,31 @@ class ResultParser:
             notice = f"完整输出已保存到:{saved_path}"
             return self._truncate_with_notice(text, max_length, notice)
         return self._truncate(text, max_length)
+
+    @staticmethod
+    def _agent_name(agent: str) -> str:
+        return "Claude" if agent == "claude" else "Codex"
+
+    @staticmethod
+    def _short_task(task: str) -> str:
+        text = " ".join(str(task).split())
+        if len(text) <= 120:
+            return text
+        return f"{text[:119]}…"
+
+    @staticmethod
+    def _next_step(parsed: ParsedResult) -> str:
+        if parsed.success:
+            if parsed.files_changed:
+                return "下一步：建议让发起方复核改动，并跑一次完整测试后再合并。"
+            return "下一步：可据此结论继续；若要落地改动，再发一次带具体规格的调用。"
+        if parsed.failure_kind == "quota":
+            return "下一步：稍后重试，或检查对应订阅的额度/限流状态。"
+        if parsed.failure_kind == "auth":
+            return "下一步：在对应桌面版完成登录后重试。"
+        if parsed.failure_kind == "timeout":
+            return "下一步：缩小任务范围，或调高 CC_BRIDGE_TIMEOUT 后重试。"
+        return "下一步：先排查上面的错误说明，必要时改用只读方式（read-only / plan）确认意图后重试。"
 
     @staticmethod
     def _format_token_usage(token_usage: dict) -> str:
