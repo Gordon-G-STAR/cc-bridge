@@ -29,9 +29,28 @@ def light_context(monkeypatch):
     monkeypatch.setattr(ContextBuilder, "build_project_context", _fake_ctx)
 
 
+@pytest.fixture(autouse=True)
+def clean_policy_env(monkeypatch):
+    """从默认本地策略出发,清掉可能从开发机继承的 policy / 链路 env。"""
+    for name in (
+        "CC_BRIDGE_POLICY_WRITABLE_PATHS",
+        "CC_BRIDGE_POLICY_READONLY",
+        "CC_BRIDGE_POLICY_ALLOW_NETWORK",
+        "CC_BRIDGE_POLICY_MAX_DEPTH",
+        "CC_BRIDGE_POLICY_REQUIRE_APPROVAL",
+        "CC_BRIDGE_LEGACY_TOOLS",
+        "CC_BRIDGE_CHAIN_DEPTH",
+        "CC_BRIDGE_CHAIN_SCOPE",
+        "CC_BRIDGE_CODEX_SANDBOX",
+        "CC_BRIDGE_CLAUDE_PERMISSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _patch_run_claude(monkeypatch, result=None, exc=None):
     async def _fake_run_claude(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         if exc is not None:
             raise exc
@@ -87,7 +106,8 @@ async def test_claude_analyze_default_does_not_add_dry_run_controls(
 
     assert "dry-run" not in out
     assert "预演" not in out
-    assert "permission_override" not in calls[0]["kwargs"]
+    # PR5:legacy 工具走 policy 地板;默认(未收紧)仍是 bypassPermissions,但显式流过。
+    assert calls[0]["kwargs"]["permission_override"] == "bypassPermissions"
     assert "dry run" not in calls[0]["prompt"].lower()
     assert "不要真正修改文件" not in calls[0]["prompt"]
 
@@ -122,7 +142,8 @@ async def test_claude_analyze_returns_and_reuses_session_id(monkeypatch, tmp_pat
     calls: list[str | None] = []
 
     async def _fake_run_claude(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         calls.append(resume_session_id)
         return ExecutionResult(
@@ -154,7 +175,8 @@ async def test_claude_analyze_continue_session_serializes_per_project(
     max_active = 0
 
     async def _fake_run_claude(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         nonlocal active, max_active
         calls.append(resume_session_id)
@@ -194,7 +216,8 @@ async def test_claude_analyze_continue_false_starts_new_session(monkeypatch, tmp
     calls: list[str | None] = []
 
     async def _fake_run_claude(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         calls.append(resume_session_id)
         return ExecutionResult(success=True, output="ok", session_id="sid-new")

@@ -39,6 +39,25 @@ cc-bridge version
 | `CC_BRIDGE_CODEX_MODEL` / `CC_BRIDGE_CLAUDE_MODEL` | 未设 | 指定模型 |
 | `CODEX_HOME` | `~/.codex` | Codex 配置目录 |
 
+## v0.2 委派策略 / 重授权(`*_handoff` + legacy 同一地板)
+
+结构化委派 `codex_handoff` / `claude_handoff` 把 `requested_scope` 当**申请**,每次都重新计算
+生效权限:`effective = requested ∩ 父链 ∩ 本地策略 ∩ 引擎上限`。下面这些变量是**唯一的真授权来源**,
+只从宿主环境读——仓库内容 / README 改不动它们。旧的 `codex_execute` / `claude_analyze` 走**同一地板**
+(关闭开关 / 链深上限 / 引擎钳制都一致),没有绕过策略的满权后门。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `CC_BRIDGE_POLICY_WRITABLE_PATHS` | 未设(=整个项目根) | `os.pathsep` 分隔的相对路径,限定**可授予写**的子树;申请越出即被收窄。分量级匹配:`src/auth` 不会命中 `src/auth_secrets` |
+| `CC_BRIDGE_POLICY_READONLY` | 关 | 置真 => 一律不授予写(覆盖 `WRITABLE_PATHS`);申请写入降级为只读 |
+| `CC_BRIDGE_POLICY_ALLOW_NETWORK` | 关 | 置真才会把 `requested_scope.network=request` 兑现 |
+| `CC_BRIDGE_POLICY_MAX_DEPTH` | `3` | 跨 agent 链路最大深度;`depth ≥ max` 一律拒绝(防 A→B→A→… 无界再入) |
+| `CC_BRIDGE_POLICY_REQUIRE_APPROVAL` | 关 | 置真 => 授予写入前需人工审批;headless(无审批者)下返回 `approval_required` 并 fail-closed,不执行 |
+| `CC_BRIDGE_LEGACY_TOOLS` | 开 | 设为 `0/false/no` 时关闭 `codex_execute` / `claude_analyze`,只保留结构化 `*_handoff` |
+
+链路 `depth` 与已授权 scope 通过子进程环境变量 `CC_BRIDGE_CHAIN_DEPTH` / `CC_BRIDGE_CHAIN_SCOPE`
+**自动下传**(非 LLM 通道),用于跨进程再入时的"子只能收窄"与链深计数——**无需手动设置**。
+
 ## 配置文件位置
 
 - Claude 桌面版 `claude_desktop_config.json`:Windows `%APPDATA%\Claude\`,macOS `~/Library/Application Support/Claude/`,Linux `~/.config/Claude/`

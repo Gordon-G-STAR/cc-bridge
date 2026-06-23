@@ -24,6 +24,7 @@ def append_audit_record(
     task: str,
     success: bool,
     files_changed: list[str],
+    extra: dict | None = None,
 ) -> None:
     log_path = os.environ.get(_AUDIT_LOG_ENV)
     if not log_path or not log_path.strip():
@@ -38,6 +39,11 @@ def append_audit_record(
             "success": bool(success),
             "files_changed": list(files_changed or []),
         }
+        # PR5:handoff 把本地策略重授权的决策(depth / write_granted / effective scope)
+        # 一并落审计,便于事后核验"README 改不了有效策略"。键名不与上面的固定字段冲突。
+        if extra:
+            for key, value in extra.items():
+                record.setdefault(str(key), value)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)

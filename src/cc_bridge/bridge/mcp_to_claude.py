@@ -19,12 +19,12 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import config, evidence
+from . import config, evidence, policy
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
 from .executor import AgentExecutor
-from .handoff import execution_to_handoff, handoff_goal_text
+from .handoff import authorize, execution_to_handoff, handoff_goal_text
 from .locks import LockBusy, async_project_lock
 from .parser import ResultParser
 from .status import check_claude
@@ -161,6 +161,18 @@ async def claude_analyze(
     except (OSError, ValueError) as exc:
         return f"无法调用 Claude：{exc}"
     try:
+        # 同一条 policy 地板:legacy 工具与 handoff 共用本地策略(关闭开关 / 链深上限 / 引擎钳制),
+        # 绝无绕过 policy 的满权后门(F5 / #12)。dry_run 仍优先强制只读 plan。
+        cfg = config.BridgeConfig.from_env()
+        legacy = policy.decide_legacy(
+            agent="claude",
+            policy=policy.LocalPolicy.from_env(),
+            chain=policy.ChainContext.from_env(),
+            codex_cap=cfg.codex_sandbox,
+            claude_cap=cfg.claude_permission_mode,
+        )
+        if legacy.refusal:
+            return legacy.refusal
         on_progress = _make_progress_callback(ctx)
         # 上下文收集（git 探测 + 目录遍历）放到线程里，不阻塞事件循环、可被取消；
         # 底层 git 调用已硬化超时（见 config.git_capture）。
@@ -177,10 +189,12 @@ async def claude_analyze(
             run_kwargs = {
                 "resume_session_id": resume_session_id,
                 "on_progress": on_progress,
+                "permission_override": (
+                    _DRY_RUN_CLAUDE_PERMISSION_MODE if dry_run else legacy.engine_mode
+                ),
+                "extra_env": legacy.child_env,
             }
-            if dry_run:
-                run_kwargs["permission_override"] = _DRY_RUN_CLAUDE_PERMISSION_MODE
-            result = await AgentExecutor().run_claude(prompt, cwd, **run_kwargs)
+            result = await AgentExecutor(cfg).run_claude(prompt, cwd, **run_kwargs)
             if result.session_id:
                 _remember_claude_session(cwd, result.session_id)
         append_audit_record(
@@ -207,11 +221,12 @@ async def claude_analyze(
 @mcp.tool(
     name="claude_handoff",
     description=(
-        "【v0.2 结构化委派 · 骨架】把一份结构化委派合同(HandoffRequest:目标 / 验收标准 / "
+        "【v0.2 结构化委派】把一份结构化委派合同(HandoffRequest:目标 / 验收标准 / "
         "申请的权限范围 requested_scope / 检查项 check_ids)交给 Claude,返回结构化结果 "
         "HandoffResult。与 claude_analyze 的区别:输入输出都是版本化结构,且 requested_scope "
-        "只是【申请】、绝不自动授权。【当前为骨架:在策略(PR5)与内容证据(PR4)子系统接入前,"
-        "一律以只读 plan 模式执行、不授权任何写入】。project_dir 必填、须为存在的绝对路径。"
+        "只是【申请】——由本地策略重授权(effective = requested ∩ 父链 ∩ 本地策略 ∩ 引擎上限);"
+        "申请超出策略会被收窄 / 降级为只读 / 拒绝;链深超限或需审批(headless)一律 fail-closed。"
+        "project_dir 必填、须为存在的绝对路径。"
     ),
 )
 async def claude_handoff(
@@ -220,7 +235,7 @@ async def claude_handoff(
     continue_session: bool = False,
     ctx: Context = None,
 ) -> HandoffResult:
-    """把结构化合同交给 Claude(骨架:只读 plan),返回 HandoffResult,绝不向 MCP 抛异常。"""
+    """把结构化合同交给 Claude(经本地策略重授权),返回 HandoffResult,绝不向 MCP 抛异常。"""
     handoff_id = uuid.uuid4().hex[:12]
     try:
         cwd = str(Path(require_project_dir(project_dir)).resolve())
@@ -232,6 +247,12 @@ async def claude_handoff(
             status="failed",
         )
     try:
+        cfg = config.BridgeConfig.from_env()
+        # 本地策略重授权:deny / approval_required / 链深超限 => fail-closed,绝不执行。
+        plan = authorize(handoff_id, request, cwd, agent="claude", cfg=cfg)
+        if isinstance(plan, HandoffResult):
+            return plan
+
         before = evidence.baseline(cwd)
         on_progress = _make_progress_callback(ctx)
         project_ctx = await asyncio.to_thread(
@@ -244,28 +265,35 @@ async def claude_handoff(
             resume_session_id = (
                 _CLAUDE_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
             )
-            result = await AgentExecutor().run_claude(
+            result = await AgentExecutor(cfg).run_claude(
                 prompt,
                 cwd,
                 timeout=request.timeout_seconds,
                 resume_session_id=resume_session_id,
                 on_progress=on_progress,
-                permission_override="plan",  # 骨架:只读 plan 模式,绝不授权写
+                permission_override=plan.engine_mode,
+                extra_env=plan.child_env,
             )
             if result.session_id:
                 _remember_claude_session(cwd, result.session_id)
-        ev = evidence.gather(cwd, before, writable_paths=())
+        ev = evidence.gather(cwd, before, writable_paths=plan.effective_writable)
         append_audit_record(
             direction="claude",
             cwd=cwd,
             task=handoff_goal_text(request),
             success=result.success,
             files_changed=result.files_changed,
+            extra={
+                "mode": "handoff",
+                "depth": plan.depth,
+                "write_granted": plan.write_granted,
+                "effective_writable": list(plan.effective_writable),
+            },
         )
         parsed = ResultParser().parse(result, "claude")
         summary = ResultParser().summarize_for_caller(parsed, "claude")
         return execution_to_handoff(
-            handoff_id, request, result, summary, "claude", evidence=ev
+            handoff_id, request, result, summary, "claude", evidence=ev, plan=plan
         )
     except LockBusy:
         return fail_closed_result(

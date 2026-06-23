@@ -529,6 +529,7 @@ class AgentExecutor:
         on_progress: ProgressCallback | None = None,
         mode_override: str | None = None,
         model: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         agent_obj = agents.get_agent(agent) if isinstance(agent, str) else agent
         exe = config.resolve_cli(agent_obj.cli_name)
@@ -558,6 +559,7 @@ class AgentExecutor:
                 final_file=final_file,
                 on_progress=on_progress,
                 session_id_hint=resume_session_id,
+                extra_env=extra_env,
             )
         finally:
             if final_file:
@@ -575,6 +577,7 @@ class AgentExecutor:
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
         permission_override: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         permission_mode = (
             permission_override
@@ -590,6 +593,7 @@ class AgentExecutor:
             on_progress=on_progress,
             mode_override=permission_mode,
             model=self.cfg.claude_model,
+            extra_env=extra_env,
         )
 
     # -- Codex ------------------------------------------------------------
@@ -601,6 +605,7 @@ class AgentExecutor:
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
         sandbox_override: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         sandbox = (
             sandbox_override if sandbox_override is not None else self.cfg.codex_sandbox
@@ -614,6 +619,7 @@ class AgentExecutor:
             on_progress=on_progress,
             mode_override=sandbox,
             model=self.cfg.codex_model,
+            extra_env=extra_env,
         )
 
     # -- 共通流程 ---------------------------------------------------------
@@ -627,6 +633,7 @@ class AgentExecutor:
         final_file: str | None = None,
         on_progress: ProgressCallback | None = None,
         session_id_hint: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         timeout = timeout or self.cfg.timeout_seconds
         cwd = str(Path(cwd))
@@ -695,6 +702,7 @@ class AgentExecutor:
                     cwd=cwd,
                     stdin_text=prompt,
                     timeout=timeout,
+                    extra_env=extra_env,
                     on_stdout_chunk=stdout_progress,
                 )
             except FileNotFoundError:
