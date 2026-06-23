@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from cc_bridge.bridge import gitsafe
+from cc_bridge.bridge import config, gitsafe
 
 
 def _git() -> str:
@@ -41,6 +40,11 @@ def _init_repo(tmp_path: Path) -> Path:
     _run_git(repo, "init", "-b", "main")
     _run_git(repo, "config", "user.email", "tester@example.invalid")
     _run_git(repo, "config", "user.name", "Tester")
+    # 固定行尾策略:gitsafe 的 clean 检查走 GIT_OPTIONAL_LOCKS=0(不刷新 index),
+    # 若依赖机器全局 autocrlf,LF 写入的文件可能被误判为已改动。显式关掉转换,
+    # 让测试在开着 autocrlf 的 Windows 机器上也确定干净(与生产无关:真实 checkout
+    # 的工作树由 git smudge 而来,本就一致)。
+    _run_git(repo, "config", "core.autocrlf", "false")
     (repo / "demo.txt").write_text("base\n", encoding="utf-8")
     _run_git(repo, "add", "demo.txt")
     _run_git(repo, "commit", "-m", "initial")
@@ -131,16 +135,28 @@ def test_finish_safe_branch_without_changes_cleans_temp_branch(tmp_path):
     assert prep.temp_branch not in _branches(repo)
 
 
-def test_finish_safe_branch_commit_failure_preserves_work_on_temp_branch(tmp_path):
+def test_finish_safe_branch_commit_failure_preserves_work_on_temp_branch(
+    monkeypatch, tmp_path
+):
     repo = _init_repo(tmp_path)
-    hook = repo / ".git" / "hooks" / "pre-commit"
-    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    os.chmod(hook, 0o755)
     prep = gitsafe.prepare_safe_branch(str(repo))
     assert prep.ok is True
     assert prep.original_branch is not None
     assert prep.temp_branch is not None
     (repo / "demo.txt").write_text("blocked by hook\n", encoding="utf-8")
+    _orig_git_capture = config.git_capture
+
+    def _fail_commit(g, cwd, args, *, timeout):
+        if "commit" in args:
+            return config.CapturedRun(
+                returncode=1,
+                stdout=b"",
+                stderr=b"pre-commit hook failed",
+                timed_out=False,
+            )
+        return _orig_git_capture(g, cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(config, "git_capture", _fail_commit)
 
     finish = gitsafe.finish_safe_branch(
         str(repo), prep.original_branch, prep.temp_branch, "触发 hook 失败"

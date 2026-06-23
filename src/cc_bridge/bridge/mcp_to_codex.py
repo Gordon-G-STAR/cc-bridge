@@ -18,7 +18,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import config, evidence, policy
+from . import config, evidence, gitsafe, policy
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
@@ -110,7 +110,9 @@ def _mark_dry_run_summary(summary: str) -> str:
         "  其中改文件。【不传、传相对路径、或目录不存在都会被直接拒绝】——"
         "  cc-bridge 不会猜测目录，以免在错误的地方改文件。\n"
         "- continue_session：传 true 续接该项目上一次的 Codex 会话（多轮接力）。\n"
-        "- dry_run：传 true 进入预演——Codex 只分析、说清会改什么，不真正落盘（read-only）。\n\n"
+        "- dry_run：传 true 进入预演——Codex 只分析、说清会改什么，不真正落盘（read-only）。\n"
+        "- git_mode：传 \"safe\" 时把改动隔离到临时分支，跑完提交到该分支并切回原分支，"
+        "使原分支不受影响（要求干净的 git 工作区）。默认 \"off\"。\n\n"
         "适用场景：需要落地的代码改动、写/修测试、重构、按规格生成新代码。"
         "返回值是 Codex 执行结果的自然语言摘要（含成功与否、改动的文件列表、说明）。"
     ),
@@ -120,6 +122,7 @@ async def codex_execute(
     project_dir: str | None = None,
     continue_session: bool = False,
     dry_run: bool = False,
+    git_mode: str = "off",
     ctx: Context = None,
 ) -> str:
     """让 Codex 在 ``project_dir`` 里执行 ``task``，返回结果摘要字符串。
@@ -153,7 +156,13 @@ async def codex_execute(
         prompt = ContextBuilder().build_task_prompt(task, project_ctx, caller="claude")
         if dry_run:
             prompt += _DRY_RUN_PROMPT_SUFFIX
+        safe_suffix = ""
         async with _codex_session_lock(cwd):
+            prep = None
+            if git_mode == "safe" and not dry_run:
+                prep = await asyncio.to_thread(gitsafe.prepare_safe_branch, cwd)
+                if not prep.ok:
+                    return f"无法以 safe 模式调用 Codex：{prep.message}"
             resume_session_id = _CODEX_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
             run_kwargs = {
                 "resume_session_id": resume_session_id,
@@ -166,6 +175,17 @@ async def codex_execute(
             result = await AgentExecutor(cfg).run_codex(prompt, cwd, **run_kwargs)
             if result.session_id:
                 _remember_codex_session(cwd, result.session_id)
+            if prep is not None:
+                finish = await asyncio.to_thread(
+                    gitsafe.finish_safe_branch,
+                    cwd,
+                    prep.original_branch,
+                    prep.temp_branch,
+                    task,
+                )
+                safe_suffix = "\n\n" + finish.note
+                if finish.diff_summary:
+                    safe_suffix += "\n\n" + finish.diff_summary
         append_audit_record(
             direction="codex",
             cwd=cwd,
@@ -175,7 +195,10 @@ async def codex_execute(
         )
         config.debug_log(f"codex_execute: Codex 返回 success={result.success}")
         parsed = ResultParser().parse(result, "codex")
-        summary = ResultParser().summarize_for_caller(parsed, "codex")
+        summary = ResultParser().summarize_for_caller(
+            parsed, "codex", caller="claude", project_dir=cwd, task=task
+        )
+        summary = summary + safe_suffix
         if dry_run:
             return _mark_dry_run_summary(summary)
         return summary

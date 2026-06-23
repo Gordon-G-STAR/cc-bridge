@@ -14,7 +14,7 @@ import asyncio
 
 import pytest
 
-from cc_bridge.bridge import mcp_to_codex
+from cc_bridge.bridge import gitsafe, mcp_to_codex
 from cc_bridge.bridge.context import ContextBuilder, ProjectContext
 from cc_bridge.bridge.executor import AgentExecutor, ExecutionResult
 from cc_bridge.bridge.status import AgentReadiness
@@ -134,6 +134,37 @@ async def test_codex_execute_dry_run_uses_read_only_and_marks_prompt_and_summary
     assert "不要真正修改文件" in calls[0]["prompt"]
     assert "dry-run" in out
     assert "预演" in out
+
+
+async def test_codex_execute_safe_mode_prepare_failure_does_not_run_codex(
+    monkeypatch, tmp_path
+):
+    async def _boom(self, prompt, cwd, **kwargs):
+        raise AssertionError("safe 前置失败时不应调用 Codex")
+
+    monkeypatch.setattr(
+        mcp_to_codex.gitsafe,
+        "prepare_safe_branch",
+        lambda cwd: gitsafe.SafePrep(ok=False, message="需要干净工作区"),
+    )
+    monkeypatch.setattr(AgentExecutor, "run_codex", _boom)
+
+    out = await mcp_to_codex.codex_execute(
+        "safe task", project_dir=str(tmp_path), git_mode="safe"
+    )
+
+    assert "无法以 safe 模式" in out
+
+
+async def test_codex_execute_summary_includes_report_header(monkeypatch, tmp_path):
+    async def _fake_run_codex(self, prompt, cwd, **kwargs):
+        return ExecutionResult(success=True, output="ok", duration_seconds=1.0)
+
+    monkeypatch.setattr(AgentExecutor, "run_codex", _fake_run_codex)
+
+    out = await mcp_to_codex.codex_execute("report task", project_dir=str(tmp_path))
+
+    assert "【cc-bridge 报告】Claude → Codex" in out
 
 
 async def test_codex_execute_returns_and_reuses_session_id(monkeypatch, tmp_path):
