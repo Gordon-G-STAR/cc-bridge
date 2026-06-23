@@ -10,10 +10,16 @@ README 只放最常用的,完整参考在这里。
 | `codex_status` | Claude | 无 |
 | `claude_analyze` | Codex | `task`、`project_dir`(绝对路径,必填)、`continue_session`、`dry_run`、`git_mode` |
 | `claude_status` | Codex | 无 |
+| `codex_handoff_async`/`_status`/`_result`/`_cancel` | Claude | 异步结构化委派给 Codex(见下「异步 handoff」) |
+| `claude_handoff_async`/`_status`/`_result`/`_cancel` | Codex | 异步结构化委派给 Claude(见下「异步 handoff」) |
 
 `project_dir` 必须是存在的绝对路径,缺失 / 相对路径 / 不存在都会被拒绝。
 
 `git_mode="safe"` 要求当前是【干净】的 git 仓库(具名分支、已有提交、无未提交改动):它把对方改动隔离到临时分支 `cc-bridge/<时间戳>`,跑完提交到该分支并切回原分支,使原分支**不受影响**;不满足前置条件会在动手前拒绝,返回的报告里带查看 / 对比 / 合并 / 丢弃该分支的命令。`dry_run` 下忽略 `git_mode`。(`git_mode` 仅作用于 legacy 的 `codex_execute` / `claude_analyze`;结构化 `*_handoff` 走自己的 evidence/scope 机制。)
+
+## 异步 handoff
+
+解决同步 MCP 长任务撞客户端超时(`-32001`)。`*_handoff_async(request, project_dir)` 立即返回 `{handoff_id, state}`,执行交给一个【独立后台进程】(server/宿主关掉也跑完);`*_handoff_status(id)` 查状态(`running`/`completed`/`failed`/`scope_violation`/`policy_denied`/`interrupted`)、`*_handoff_result(id)` 取结构化 `HandoffResult`、`*_handoff_cancel(id)` 杀后台进程并标 `interrupted`。runner 进程消失而未写终态时 status 会如实标 `interrupted`(绝不假装完成)。授权由 runner 权威重算(一条强制路径)。并发上限 `CC_BRIDGE_MAX_ASYNC_HANDOFFS`(默认 4)。仍是 MCP SDK v2 Tasks 之前的临时方案;详见 [`async-handoff-design.md`](async-handoff-design.md)。
 
 ## 命令
 

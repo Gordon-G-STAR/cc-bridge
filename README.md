@@ -34,7 +34,7 @@ cc-bridge install      # 然后重启 Claude 和 Codex
 | `codex_execute` / `claude_analyze` | legacy 自由文本 | 简单任务、快速评审、日常迭代 |
 | `codex_handoff` / `claude_handoff` | v0.2 结构化合同 | 需要权限可控 / 可审计的委派 |
 
-> handoff 现状限制(诚实说):同步 MCP 长任务会撞客户端超时(`-32001`,异步通道待 MCP SDK v2 Tasks);回滚是「检测不补」(成功但有改动会标 `detected_but_not_reverted`)。**长任务目前更稳的是 legacy + `git_mode="safe"`。** 可运行示例见 [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/)。
+> 长任务用**异步** handoff:`codex_handoff_async` / `claude_handoff_async` 立即返回 handoff_id、执行在独立后台进程进行(server/宿主关掉也跑完、不撞 `-32001`),用 `*_handoff_status` / `*_handoff_result` 查、`*_handoff_cancel` 取消。诚实限制:回滚仍是「检测不补」(成功但有改动会标 `detected_but_not_reverted`);异步是 MCP SDK v2 Tasks 之前的临时方案。可运行示例见 [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/)。
 
 ## 注意
 
@@ -80,7 +80,7 @@ In Claude: "design this change, then have Codex implement it and run the tests u
 | `codex_execute` / `claude_analyze` | legacy free-text | simple tasks, quick reviews, daily iteration |
 | `codex_handoff` / `claude_handoff` | v0.2 structured contract | when you need controlled / auditable scope |
 
-> Honest limits today: synchronous MCP times out on long handoffs (`-32001`; async awaits MCP SDK v2 Tasks), and rollback is "detect, not revert" (a successful handoff with changes is marked `detected_but_not_reverted`). **For long tasks, legacy + `git_mode="safe"` is currently more reliable.** Runnable example: [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/).
+> For long tasks use **async** handoff: `codex_handoff_async` / `claude_handoff_async` return a handoff_id immediately and run in a detached background process (survives the host closing, no `-32001`); poll with `*_handoff_status` / `*_handoff_result`, cancel with `*_handoff_cancel`. Honest limit: rollback is still "detect, not revert" (a successful handoff with changes is marked `detected_but_not_reverted`); async is a stopgap until MCP SDK v2 Tasks. Runnable example: [`examples/contracted_handoff_demo/`](examples/contracted_handoff_demo/).
 
 ### Heads up
 

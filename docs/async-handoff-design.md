@@ -1,6 +1,6 @@
 # 异步 Handoff 设计 — detached runner(方案 B)
 
-**状态:设计稿(2026-06-23)。** 目标:解决「同步 MCP 长任务撞客户端超时 `-32001`」这一 v0.2 根本短板,且 server/宿主中途死掉也能把 handoff 跑完。
+**状态:已实现(2026-06-23,detached runner / 方案 B;见 PR-a/b/c)。** 解决「同步 MCP 长任务撞客户端超时 `-32001`」这一 v0.2 根本短板,且 server/宿主中途死掉也能把 handoff 跑完(状态落盘 + PID 存活检测标 `interrupted`)。仍是 MCP SDK v2 Tasks 之前的【临时方案】——SDK v2 出来后改用协议级 task。
 
 ## 1. 根因
 
