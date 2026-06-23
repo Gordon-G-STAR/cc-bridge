@@ -689,6 +689,12 @@ def main() -> int:
         idx = argv.index("--mcp-server")
         which = argv[idx + 1] if idx + 1 < len(argv) else ""
         return _run_mcp_server(which)
+    if "--handoff-runner" in argv:
+        # frozen 自拉起异步 handoff runner（见 config.runner_launch_argv）。
+        idx = argv.index("--handoff-runner")
+        handoff_id = argv[idx + 1] if idx + 1 < len(argv) else ""
+        from cc_bridge.bridge.handoff_runner import main as _runner_main
+        return _runner_main([handoff_id])
 
     try:
         import tkinter as tk

@@ -14,8 +14,9 @@ import asyncio
 
 import pytest
 
-from cc_bridge.bridge import gitsafe, mcp_to_codex
+from cc_bridge.bridge import config, gitsafe, handoff_store, mcp_to_codex
 from cc_bridge.bridge.context import ContextBuilder, ProjectContext
+from cc_bridge.bridge.contracts import HandoffRequest, HandoffResult, RequestedScope
 from cc_bridge.bridge.executor import AgentExecutor, ExecutionResult
 from cc_bridge.bridge.status import AgentReadiness
 
@@ -57,6 +58,14 @@ def _patch_run_codex(monkeypatch, result=None, exc=None):
         return result
 
     monkeypatch.setattr(AgentExecutor, "run_codex", _fake_run_codex)
+
+
+def _handoff_request() -> HandoffRequest:
+    return HandoffRequest(
+        contract_version="1",
+        goal="async handoff task",
+        requested_scope=RequestedScope(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -339,6 +348,111 @@ async def test_codex_execute_rejects_nonexistent_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(AgentExecutor, "run_codex", _boom)
     out = await mcp_to_codex.codex_execute("x", project_dir=str(tmp_path / "nope"))
     assert "不存在" in out
+
+
+async def test_codex_handoff_async_initializes_and_spawns_runner(monkeypatch, tmp_path):
+    calls: dict[str, object] = {}
+    status_writes: list[tuple[str, str, str]] = []
+
+    def fake_init(request, cwd, *, agent, caller):
+        calls["init"] = {
+            "request": request,
+            "cwd": cwd,
+            "agent": agent,
+            "caller": caller,
+        }
+        return "hid-fixed"
+
+    def fake_spawn(handoff_id, *, cwd, env=None):
+        calls["spawn"] = {"handoff_id": handoff_id, "cwd": cwd, "env": env}
+        return 12345
+
+    monkeypatch.setattr(handoff_store, "init_handoff", fake_init)
+    monkeypatch.setattr(config, "spawn_detached_runner", fake_spawn)
+    monkeypatch.setattr(
+        mcp_to_codex,
+        "authorize",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("async handoff 不应重复 authorize")
+        ),
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "write_pid",
+        lambda handoff_id, pid: calls.setdefault("pid", (handoff_id, pid)),
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "write_status",
+        lambda handoff_id, state, note="": status_writes.append(
+            (handoff_id, state, note)
+        ),
+    )
+
+    out = await mcp_to_codex.codex_handoff_async(
+        _handoff_request(), project_dir=str(tmp_path)
+    )
+
+    assert out == {"handoff_id": "hid-fixed", "state": "running"}
+    assert calls["init"]["cwd"] == str(tmp_path.resolve())
+    assert calls["init"]["agent"] == "codex"
+    assert calls["init"]["caller"] == "claude"
+    assert calls["spawn"] == {
+        "handoff_id": "hid-fixed",
+        "cwd": str(tmp_path.resolve()),
+        "env": None,
+    }
+    assert calls["pid"] == ("hid-fixed", 12345)
+    assert status_writes == [
+        ("hid-fixed", "running", "runner 已启动(pid=12345)")
+    ]
+
+
+async def test_codex_handoff_status_and_result_read_store(monkeypatch):
+    monkeypatch.setattr(
+        handoff_store,
+        "read_status",
+        lambda handoff_id: {"state": "running", "note": "busy"}
+        if handoff_id == "hid-running"
+        else None,
+    )
+
+    assert await mcp_to_codex.codex_handoff_status("hid-running") == {
+        "state": "running",
+        "note": "busy",
+    }
+    assert await mcp_to_codex.codex_handoff_status("missing") == {
+        "state": "unknown",
+        "note": "无此 handoff_id",
+    }
+
+    result = HandoffResult(
+        contract_version="1",
+        handoff_id="hid-done",
+        status="completed",
+        agent_used="codex",
+        summary="done",
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "read_result",
+        lambda handoff_id: result if handoff_id == "hid-done" else None,
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "read_status",
+        lambda handoff_id: {"state": "running", "note": "busy"}
+        if handoff_id == "hid-pending"
+        else None,
+    )
+
+    assert await mcp_to_codex.codex_handoff_result("hid-done") == result.model_dump(
+        mode="json"
+    )
+    assert await mcp_to_codex.codex_handoff_result("hid-pending") == {
+        "state": "running",
+        "note": "结果尚未就绪或不存在",
+    }
 
 
 async def test_codex_status_ready(monkeypatch):

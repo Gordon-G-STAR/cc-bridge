@@ -18,7 +18,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import config, evidence, gitsafe, policy
+from . import config, evidence, gitsafe, handoff_store, policy
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
 from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
@@ -316,6 +316,77 @@ async def claude_handoff(
             reason=f"调用 Claude 时内部错误:{exc}",
             status="failed",
         )
+
+
+@mcp.tool(
+    name="claude_handoff_async",
+    description=(
+        "异步结构化委派给 Claude:立即返回 handoff_id,执行在独立后台进程进行。"
+        "用 claude_handoff_status / claude_handoff_result 查询状态和结果;不阻塞、不撞 MCP -32001;"
+        "暂不支持 continue_session。授权不在此工具重复执行,由 runner 权威执行。"
+    ),
+)
+async def claude_handoff_async(
+    request: HandoffRequest,
+    project_dir: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """初始化 handoff spec 并 detached spawn runner,不重复授权。"""
+    try:
+        cwd = str(Path(require_project_dir(project_dir)).resolve())
+    except (OSError, ValueError) as exc:
+        return {"state": "failed", "note": f"project_dir 无效:{exc}"}
+
+    try:
+        handoff_id = handoff_store.init_handoff(
+            request, cwd, agent="claude", caller="codex"
+        )
+    except Exception as exc:  # noqa: BLE001 - MCP 工具边界不抛异常
+        return {"state": "failed", "note": f"初始化失败:{exc}"}
+
+    try:
+        pid = config.spawn_detached_runner(handoff_id, cwd=cwd)
+        handoff_store.write_pid(handoff_id, pid)
+        handoff_store.write_status(
+            handoff_id, "running", f"runner 已启动(pid={pid})"
+        )
+        return {"handoff_id": handoff_id, "state": "running"}
+    except Exception as exc:  # noqa: BLE001 - spawn 失败也落状态并返回 dict
+        try:
+            handoff_store.write_status(handoff_id, "failed", f"spawn 失败:{exc}")
+        except Exception:
+            pass
+        return {"handoff_id": handoff_id, "state": "failed", "note": str(exc)}
+
+
+@mcp.tool(
+    name="claude_handoff_status",
+    description="查询异步 Claude handoff 的当前状态;永不抛异常。",
+)
+async def claude_handoff_status(handoff_id: str) -> dict:
+    try:
+        status = handoff_store.read_status(handoff_id)
+        return status or {"state": "unknown", "note": "无此 handoff_id"}
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "failed", "note": str(exc)}
+
+
+@mcp.tool(
+    name="claude_handoff_result",
+    description="读取异步 Claude handoff 的最终结构化结果;尚未完成时返回当前状态。",
+)
+async def claude_handoff_result(handoff_id: str) -> dict:
+    try:
+        result = handoff_store.read_result(handoff_id)
+        if result is not None:
+            return result.model_dump(mode="json")
+        status = handoff_store.read_status(handoff_id)
+        return {
+            "state": (status or {}).get("state", "unknown"),
+            "note": "结果尚未就绪或不存在",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "failed", "note": str(exc)}
 
 
 @mcp.tool(
