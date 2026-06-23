@@ -6,12 +6,14 @@ README 只放最常用的,完整参考在这里。
 
 | 工具 | 装在 | 参数 |
 | --- | --- | --- |
-| `codex_execute` | Claude | `task`、`project_dir`(绝对路径,必填)、`continue_session`(续接上次会话)、`dry_run`(预演,只分析不改文件) |
+| `codex_execute` | Claude | `task`、`project_dir`(绝对路径,必填)、`continue_session`(续接上次会话)、`dry_run`(预演,只分析不改文件)、`git_mode`(`"safe"`=把改动隔离到临时分支) |
 | `codex_status` | Claude | 无 |
-| `claude_analyze` | Codex | `task`、`project_dir`(绝对路径,必填)、`continue_session`、`dry_run` |
+| `claude_analyze` | Codex | `task`、`project_dir`(绝对路径,必填)、`continue_session`、`dry_run`、`git_mode` |
 | `claude_status` | Codex | 无 |
 
 `project_dir` 必须是存在的绝对路径,缺失 / 相对路径 / 不存在都会被拒绝。
+
+`git_mode="safe"` 要求当前是【干净】的 git 仓库(具名分支、已有提交、无未提交改动):它把对方改动隔离到临时分支 `cc-bridge/<时间戳>`,跑完提交到该分支并切回原分支,使原分支**不受影响**;不满足前置条件会在动手前拒绝,返回的报告里带查看 / 对比 / 合并 / 丢弃该分支的命令。`dry_run` 下忽略 `git_mode`。(`git_mode` 仅作用于 legacy 的 `codex_execute` / `claude_analyze`;结构化 `*_handoff` 走自己的 evidence/scope 机制。)
 
 ## 命令
 
@@ -20,6 +22,10 @@ cc-bridge status     # 检测两端是否就绪
 cc-bridge selftest   # 启动自检:拉起 <launcher> --mcp-server 做一次 MCP 握手
 cc-bridge test       # 实际各调一次,验证双向连通
 cc-bridge install    # 写配置(--no-test / --force 可选)
+                     # 可顺手把保守安全配置持久化进两端 MCP 记录的 env:
+                     #   --allowed-roots <绝对路径>   限定可操作目录
+                     #   --codex-sandbox read-only    Codex 默认只读
+                     #   --audit-log <文件路径>        开启审计日志
 cc-bridge uninstall  # 移除配置
 cc-bridge version
 ```
