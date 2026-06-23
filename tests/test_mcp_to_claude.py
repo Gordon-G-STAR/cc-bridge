@@ -14,8 +14,9 @@ import asyncio
 
 import pytest
 
-from cc_bridge.bridge import gitsafe, mcp_to_claude
+from cc_bridge.bridge import config, gitsafe, handoff_store, mcp_to_claude
 from cc_bridge.bridge.context import ContextBuilder, ProjectContext
+from cc_bridge.bridge.contracts import HandoffRequest, HandoffResult, RequestedScope
 from cc_bridge.bridge.executor import AgentExecutor, ExecutionResult
 from cc_bridge.bridge.status import AgentReadiness
 
@@ -57,6 +58,14 @@ def _patch_run_claude(monkeypatch, result=None, exc=None):
         return result
 
     monkeypatch.setattr(AgentExecutor, "run_claude", _fake_run_claude)
+
+
+def _handoff_request() -> HandoffRequest:
+    return HandoffRequest(
+        contract_version="1",
+        goal="async handoff task",
+        requested_scope=RequestedScope(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -299,6 +308,179 @@ async def test_claude_analyze_rejects_relative_project_dir(monkeypatch):
     monkeypatch.setattr(AgentExecutor, "run_claude", _boom)
     out = await mcp_to_claude.claude_analyze("x", project_dir="relative/dir")
     assert "绝对路径" in out
+
+
+async def test_claude_handoff_async_initializes_and_spawns_runner(monkeypatch, tmp_path):
+    calls: dict[str, object] = {}
+    status_writes: list[tuple[str, str, str]] = []
+
+    def fake_init(request, cwd, *, agent, caller):
+        calls["init"] = {
+            "request": request,
+            "cwd": cwd,
+            "agent": agent,
+            "caller": caller,
+        }
+        return "hid-fixed"
+
+    def fake_spawn(handoff_id, *, cwd, env=None):
+        calls["spawn"] = {"handoff_id": handoff_id, "cwd": cwd, "env": env}
+        return 12345
+
+    monkeypatch.setattr(handoff_store, "init_handoff", fake_init)
+    monkeypatch.setattr(config, "spawn_detached_runner", fake_spawn)
+    monkeypatch.setattr(
+        mcp_to_claude,
+        "authorize",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("async handoff 不应重复 authorize")
+        ),
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "write_pid",
+        lambda handoff_id, pid: calls.setdefault("pid", (handoff_id, pid)),
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "write_status",
+        lambda handoff_id, state, note="": status_writes.append(
+            (handoff_id, state, note)
+        ),
+    )
+
+    out = await mcp_to_claude.claude_handoff_async(
+        _handoff_request(), project_dir=str(tmp_path)
+    )
+
+    assert out == {"handoff_id": "hid-fixed", "state": "running"}
+    assert calls["init"]["cwd"] == str(tmp_path.resolve())
+    assert calls["init"]["agent"] == "claude"
+    assert calls["init"]["caller"] == "codex"
+    assert calls["spawn"] == {
+        "handoff_id": "hid-fixed",
+        "cwd": str(tmp_path.resolve()),
+        "env": None,
+    }
+    assert calls["pid"] == ("hid-fixed", 12345)
+    assert status_writes == [
+        ("hid-fixed", "running", "runner 已启动(pid=12345)")
+    ]
+
+
+async def test_claude_handoff_async_rejects_when_concurrency_limit_is_full(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(handoff_store, "count_active", lambda: 4)
+    monkeypatch.setattr(config, "max_async_handoffs", lambda: 4)
+    monkeypatch.setattr(
+        handoff_store,
+        "init_handoff",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("并发上限已满时不应初始化 handoff")
+        ),
+    )
+    monkeypatch.setattr(
+        config,
+        "spawn_detached_runner",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("并发上限已满时不应启动 runner")
+        ),
+    )
+
+    out = await mcp_to_claude.claude_handoff_async(
+        _handoff_request(), project_dir=str(tmp_path)
+    )
+
+    assert out["state"] == "failed"
+    assert "并发上限" in out["note"]
+
+
+async def test_claude_handoff_status_and_result_read_store(monkeypatch):
+    monkeypatch.setattr(
+        handoff_store,
+        "read_status",
+        lambda handoff_id: {"state": "running", "note": "busy"}
+        if handoff_id == "hid-running"
+        else None,
+    )
+    monkeypatch.setattr(handoff_store, "runner_alive", lambda handoff_id: True)
+
+    assert await mcp_to_claude.claude_handoff_status("hid-running") == {
+        "state": "running",
+        "note": "busy",
+    }
+    assert await mcp_to_claude.claude_handoff_status("missing") == {
+        "state": "unknown",
+        "note": "无此 handoff_id",
+    }
+
+    result = HandoffResult(
+        contract_version="1",
+        handoff_id="hid-done",
+        status="completed",
+        agent_used="claude",
+        summary="done",
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "read_result",
+        lambda handoff_id: result if handoff_id == "hid-done" else None,
+    )
+    monkeypatch.setattr(
+        handoff_store,
+        "read_status",
+        lambda handoff_id: {"state": "running", "note": "busy"}
+        if handoff_id == "hid-pending"
+        else None,
+    )
+
+    assert await mcp_to_claude.claude_handoff_result("hid-done") == result.model_dump(
+        mode="json"
+    )
+    assert await mcp_to_claude.claude_handoff_result("hid-pending") == {
+        "state": "running",
+        "note": "结果尚未就绪或不存在",
+    }
+
+
+async def test_claude_handoff_status_marks_missing_runner_interrupted(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "stable_app_dir", lambda: tmp_path / "app")
+    handoff_id = handoff_store.init_handoff(
+        _handoff_request(), str(tmp_path), agent="claude", caller="codex"
+    )
+    handoff_store.write_status(handoff_id, "running", "busy")
+    handoff_store.write_pid(handoff_id, 2147483647)
+
+    out = await mcp_to_claude.claude_handoff_status(handoff_id)
+
+    assert out["state"] == "interrupted"
+    assert "runner" in out["note"]
+    assert handoff_store.read_status(handoff_id)["state"] == "interrupted"
+
+
+async def test_claude_handoff_cancel_kills_runner_and_marks_interrupted(monkeypatch):
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(handoff_store, "read_pid", lambda handoff_id: 98765)
+
+    def fake_kill_runner(pid):
+        calls["pid"] = pid
+        return True
+
+    def fake_write_status(handoff_id, state, note=""):
+        calls["status"] = (handoff_id, state, note)
+
+    monkeypatch.setattr(handoff_store, "kill_runner", fake_kill_runner)
+    monkeypatch.setattr(handoff_store, "write_status", fake_write_status)
+
+    out = await mcp_to_claude.claude_handoff_cancel("hid-cancel")
+
+    assert out == {"handoff_id": "hid-cancel", "state": "interrupted"}
+    assert calls["pid"] == 98765
+    assert calls["status"] == ("hid-cancel", "interrupted", "已取消")
 
 
 async def test_claude_status_ready(monkeypatch):

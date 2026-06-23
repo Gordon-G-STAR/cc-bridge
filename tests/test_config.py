@@ -8,6 +8,7 @@ mcp_launch_command 决策。这些都是确定性纯函数，最该被锁住以�
 from __future__ import annotations
 
 import sys
+import subprocess
 
 import pytest
 
@@ -108,6 +109,20 @@ def test_from_env_defaults(monkeypatch):
     assert cfg.claude_permission_mode == "bypassPermissions"
 
 
+def test_max_async_handoffs_reads_env_and_never_below_one(monkeypatch):
+    monkeypatch.delenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", raising=False)
+    assert config.max_async_handoffs() == 4
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "9")
+    assert config.max_async_handoffs() == 9
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "-3")
+    assert config.max_async_handoffs() == 1
+
+    monkeypatch.setenv("CC_BRIDGE_MAX_ASYNC_HANDOFFS", "not-a-number")
+    assert config.max_async_handoffs() == 4
+
+
 # ---------------------------------------------------------------------------
 # mcp_launch_command —— frozen 决策
 # ---------------------------------------------------------------------------
@@ -162,6 +177,85 @@ def test_mcp_launch_command_frozen_no_option_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 # _is_bundled_executable：onefile vs onedir/.app
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# handoff runner detached spawn
+# ---------------------------------------------------------------------------
+
+def test_runner_launch_argv_dev_uses_python_module(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    assert config.runner_launch_argv("hid123") == [
+        sys.executable,
+        "-m",
+        "cc_bridge.bridge.handoff_runner",
+        "hid123",
+    ]
+
+
+def test_spawn_detached_runner_windows_retries_without_breakaway(monkeypatch):
+    monkeypatch.setattr(config, "IS_WINDOWS", True)
+    monkeypatch.setattr(config, "runner_launch_argv", lambda handoff_id: ["runner", handoff_id])
+    monkeypatch.setenv("CC_BRIDGE_PARENT_ENV", "parent")
+    calls: list[dict] = []
+
+    class FakeProc:
+        pid = 4321
+
+    def fake_popen(argv, **kwargs):
+        calls.append({"argv": argv, "kwargs": kwargs})
+        if len(calls) == 1:
+            raise OSError("not in a job")
+        return FakeProc()
+
+    monkeypatch.setattr(config.subprocess, "Popen", fake_popen)
+
+    pid = config.spawn_detached_runner("hid123", cwd=r"C:\repo", env={"EXTRA": "1"})
+
+    assert pid == 4321
+    assert len(calls) == 2
+    first_flags = calls[0]["kwargs"]["creationflags"]
+    assert first_flags & config.DETACHED_PROCESS
+    assert first_flags & config.CREATE_NEW_PROCESS_GROUP
+    assert first_flags & config.CREATE_BREAKAWAY_FROM_JOB
+    second_flags = calls[1]["kwargs"]["creationflags"]
+    assert second_flags & config.DETACHED_PROCESS
+    assert second_flags & config.CREATE_NEW_PROCESS_GROUP
+    assert not (second_flags & config.CREATE_BREAKAWAY_FROM_JOB)
+    assert calls[1]["argv"] == ["runner", "hid123"]
+    assert calls[1]["kwargs"]["cwd"] == r"C:\repo"
+    assert calls[1]["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert calls[1]["kwargs"]["stdout"] is subprocess.DEVNULL
+    assert calls[1]["kwargs"]["stderr"] is subprocess.DEVNULL
+    assert calls[1]["kwargs"]["env"]["CC_BRIDGE_PARENT_ENV"] == "parent"
+    assert calls[1]["kwargs"]["env"]["EXTRA"] == "1"
+
+
+def test_spawn_detached_runner_posix_starts_new_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "IS_WINDOWS", False)
+    monkeypatch.setattr(config, "runner_launch_argv", lambda handoff_id: ["runner", handoff_id])
+    calls: list[dict] = []
+
+    class FakeProc:
+        pid = 2468
+
+    def fake_popen(argv, **kwargs):
+        calls.append({"argv": argv, "kwargs": kwargs})
+        return FakeProc()
+
+    monkeypatch.setattr(config.subprocess, "Popen", fake_popen)
+
+    pid = config.spawn_detached_runner("hid-posix", cwd=str(tmp_path))
+
+    assert pid == 2468
+    assert len(calls) == 1
+    assert calls[0]["argv"] == ["runner", "hid-posix"]
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+    assert calls[0]["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert calls[0]["kwargs"]["stdout"] is subprocess.DEVNULL
+    assert calls[0]["kwargs"]["stderr"] is subprocess.DEVNULL
+    assert calls[0]["kwargs"]["start_new_session"] is True
+    assert "creationflags" not in calls[0]["kwargs"]
+
 
 from pathlib import Path  # noqa: E402
 

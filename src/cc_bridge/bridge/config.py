@@ -29,6 +29,11 @@ DEFAULT_MAX_OUTPUT_CHARS = 4000        # 返回摘要的最大字符数，防止
 # Windows 上隐藏控制台窗口的 creationflag（CREATE_NO_WINDOW）。
 _CREATE_NO_WINDOW = 0x08000000
 
+# Windows detached runner 的 CreateProcess flags。
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
 IS_WINDOWS = os.name == "nt"
 IS_MACOS = sys.platform == "darwin"
 
@@ -452,6 +457,66 @@ def _should_refresh_launcher(src: Path, target: Path) -> bool:
     return s.st_mtime > t.st_mtime + 2
 
 
+def runner_launch_argv(handoff_id: str) -> list[str]:
+    """返回异步 handoff runner 的启动 argv。
+
+    普通开发 / pip 安装形态直接用当前 Python 解释器跑模块；frozen 形态优先自拉起
+    持久 launcher，让打包产物内的代码版本保持权威。若 frozen launcher 不可得，再退回
+    到能 import cc_bridge 的 Python。
+    """
+    module = "cc_bridge.bridge.handoff_runner"
+    if not getattr(sys, "frozen", False):
+        return [sys.executable, "-m", module, handoff_id]
+
+    try:
+        launcher = _ensure_frozen_launcher()
+    except Exception:
+        launcher = ""
+    if launcher:
+        return [launcher, "--handoff-runner", handoff_id]
+
+    py = _find_python_with_cc_bridge()
+    if py:
+        return [py, "-m", module, handoff_id]
+    raise RuntimeError("无法确定可启动 handoff runner 的命令")
+
+
+def spawn_detached_runner(
+    handoff_id: str, *, cwd: str, env: dict | None = None
+) -> int:
+    """以脱离当前 MCP 进程生命周期的方式启动 runner,fire-and-forget。
+
+    stdin/stdout/stderr 必须全部断开，避免后台 runner 继承并污染 MCP stdio 管道。
+    Windows 上优先尝试从 Job 中 breakaway；若父进程本身不在 Job 中，该 flag 可能导致
+    CreateProcess 失败，此时去掉 breakaway 重试一次。
+    """
+    argv = runner_launch_argv(handoff_id)
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "cwd": cwd,
+        "env": full_env,
+    }
+    if IS_WINDOWS:
+        base_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        try:
+            proc = subprocess.Popen(
+                argv,
+                **kwargs,
+                creationflags=base_flags | CREATE_BREAKAWAY_FROM_JOB,
+            )
+        except OSError:
+            proc = subprocess.Popen(argv, **kwargs, creationflags=base_flags)
+    else:
+        proc = subprocess.Popen(argv, **kwargs, start_new_session=True)
+    return int(proc.pid)
+
+
 def mcp_launch_command(
     module: str,
     console_script: str | None = None,
@@ -526,6 +591,10 @@ def env_bool(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def max_async_handoffs() -> int:
+    return max(1, _env_int("CC_BRIDGE_MAX_ASYNC_HANDOFFS", 4))
 
 
 @dataclass
