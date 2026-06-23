@@ -29,9 +29,28 @@ def light_context(monkeypatch):
     monkeypatch.setattr(ContextBuilder, "build_project_context", _fake_ctx)
 
 
+@pytest.fixture(autouse=True)
+def clean_policy_env(monkeypatch):
+    """从默认本地策略出发,清掉可能从开发机继承的 policy / 链路 env。"""
+    for name in (
+        "CC_BRIDGE_POLICY_WRITABLE_PATHS",
+        "CC_BRIDGE_POLICY_READONLY",
+        "CC_BRIDGE_POLICY_ALLOW_NETWORK",
+        "CC_BRIDGE_POLICY_MAX_DEPTH",
+        "CC_BRIDGE_POLICY_REQUIRE_APPROVAL",
+        "CC_BRIDGE_LEGACY_TOOLS",
+        "CC_BRIDGE_CHAIN_DEPTH",
+        "CC_BRIDGE_CHAIN_SCOPE",
+        "CC_BRIDGE_CODEX_SANDBOX",
+        "CC_BRIDGE_CLAUDE_PERMISSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _patch_run_codex(monkeypatch, result=None, exc=None):
     async def _fake_run_codex(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         if exc is not None:
             raise exc
@@ -85,7 +104,8 @@ async def test_codex_execute_default_does_not_add_dry_run_controls(
 
     assert "dry-run" not in out
     assert "预演" not in out
-    assert "sandbox_override" not in calls[0]["kwargs"]
+    # PR5:legacy 工具走 policy 地板;默认(未收紧)仍是 workspace-write,但显式流过。
+    assert calls[0]["kwargs"]["sandbox_override"] == "workspace-write"
     assert "dry run" not in calls[0]["prompt"].lower()
     assert "不要真正修改文件" not in calls[0]["prompt"]
 
@@ -121,7 +141,8 @@ async def test_codex_execute_returns_and_reuses_session_id(monkeypatch, tmp_path
     calls: list[str | None] = []
 
     async def _fake_run_codex(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         calls.append(resume_session_id)
         return ExecutionResult(
@@ -152,7 +173,8 @@ async def test_codex_execute_continue_session_serializes_per_project(monkeypatch
     max_active = 0
 
     async def _fake_run_codex(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         nonlocal active, max_active
         calls.append(resume_session_id)
@@ -188,7 +210,8 @@ async def test_codex_execute_continue_false_starts_new_session(monkeypatch, tmp_
     calls: list[str | None] = []
 
     async def _fake_run_codex(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         calls.append(resume_session_id)
         return ExecutionResult(success=True, output="ok", session_id="sid-new")
@@ -215,7 +238,8 @@ async def test_codex_execute_progress_ctx_errors_do_not_break(monkeypatch, tmp_p
             raise RuntimeError("info broke")
 
     async def _fake_run_codex(
-        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None
+        self, prompt, cwd, timeout=None, resume_session_id=None, on_progress=None,
+        **kwargs,
     ):
         assert on_progress is not None
         await on_progress("正在执行 pytest")
@@ -352,6 +376,20 @@ async def test_codex_execute_ctx_is_injected_not_input_schema():
     codex_tool = next(tool for tool in tools if tool.name == "codex_execute")
     assert "ctx" not in codex_tool.inputSchema.get("properties", {})
     assert "dry_run" in codex_tool.inputSchema.get("properties", {})
+
+
+async def test_codex_handoff_exposes_input_and_output_schema():
+    """PR6:结构化委派的输入 / 输出 schema 都对 MCP Inspector 可见(版本化)。"""
+    from cc_bridge.bridge.mcp_to_codex import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    handoff = tools["codex_handoff"]
+    assert "request" in handoff.inputSchema.get("properties", {})
+    assert "HandoffRequest" in (handoff.inputSchema.get("$defs") or {})
+    assert "ctx" not in handoff.inputSchema.get("properties", {})
+    out = getattr(handoff, "outputSchema", None)
+    assert out is not None
+    assert "status" in (out.get("properties") or {})
 
 
 @pytest.fixture(autouse=True)

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import agents, config
+from . import jobobject
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 ProgressChunkHandler = Callable[[str], None]
@@ -278,64 +279,67 @@ async def _run(
 
     超时时终止进程树，但仍返回已经读到的部分输出。
     """
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
+    # P0.1：用 allow-list 构造子进程环境，不把父进程整份环境（可能含密钥）泄给 agent。
+    env = config.build_child_env(extra_env)
 
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        **config.subprocess_creation_kwargs(),
-    )
+    with jobobject.kill_on_close_job() as _job:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            **config.subprocess_creation_kwargs(),
+        )
+        _job.assign(proc.pid)
 
-    progress_dispatcher = _ProgressDispatcher(on_stdout_chunk)
-    progress_dispatcher.start()
+        progress_dispatcher = _ProgressDispatcher(on_stdout_chunk)
+        progress_dispatcher.start()
 
-    out_task = asyncio.create_task(_pump(proc.stdout, on_chunk=progress_dispatcher.enqueue))
-    err_task = asyncio.create_task(_pump(proc.stderr))
+        out_task = asyncio.create_task(
+            _pump(proc.stdout, on_chunk=progress_dispatcher.enqueue)
+        )
+        err_task = asyncio.create_task(_pump(proc.stderr))
 
     # 把 prompt 通过 stdin 送进去然后关闭，告知 CLI 输入结束。
-    if proc.stdin is not None:
-        try:
-            proc.stdin.write(stdin_text.encode("utf-8"))
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-        finally:
+        if proc.stdin is not None:
             try:
-                proc.stdin.close()
-            except Exception:
+                proc.stdin.write(stdin_text.encode("utf-8"))
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
-    timed_out = False
-    try:
+        timed_out = False
         try:
-            await asyncio.wait_for(proc.wait(), timeout)
-        except asyncio.TimeoutError:
-            timed_out = True
-            await _terminate(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout)
+            except asyncio.TimeoutError:
+                timed_out = True
+                await _terminate(proc)
         # 进程已退出（或已尽力终止）。有界地收集 pump 输出——即便有孙进程仍持管道、
         # 读不到 EOF，也只等有限时间后返回已读到的部分，绝不无限挂死。
-        out = (await _drain(out_task)).decode("utf-8", errors="replace")
-        err = (await _drain(err_task)).decode("utf-8", errors="replace")
-        return out, err, proc.returncode, timed_out
-    except asyncio.CancelledError:
+            out = (await _drain(out_task)).decode("utf-8", errors="replace")
+            err = (await _drain(err_task)).decode("utf-8", errors="replace")
+            return out, err, proc.returncode, timed_out
+        except asyncio.CancelledError:
         # 被上层取消（GUI「跳过 / 上一步 / 关窗」）：杀掉子进程树，再把取消向上抛，
         # 否则 codex / claude 会在后台继续跑、继续消耗订阅额度。
-        await _terminate(proc)
-        raise
-    finally:
+            await _terminate(proc)
+            raise
+        finally:
         # 任何退出路径（正常 / 超时 / 取消，含「超时清理时又被取消」的叠加竞态）
         # 都不留下悬挂的 pump 任务。
-        for pump_task in (out_task, err_task):
-            if not pump_task.done():
-                pump_task.cancel()
-        await asyncio.gather(out_task, err_task, return_exceptions=True)
-        await progress_dispatcher.stop()
+            for pump_task in (out_task, err_task):
+                if not pump_task.done():
+                    pump_task.cancel()
+            await asyncio.gather(out_task, err_task, return_exceptions=True)
+            await progress_dispatcher.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +529,7 @@ class AgentExecutor:
         on_progress: ProgressCallback | None = None,
         mode_override: str | None = None,
         model: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         agent_obj = agents.get_agent(agent) if isinstance(agent, str) else agent
         exe = config.resolve_cli(agent_obj.cli_name)
@@ -554,6 +559,7 @@ class AgentExecutor:
                 final_file=final_file,
                 on_progress=on_progress,
                 session_id_hint=resume_session_id,
+                extra_env=extra_env,
             )
         finally:
             if final_file:
@@ -571,6 +577,7 @@ class AgentExecutor:
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
         permission_override: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         permission_mode = (
             permission_override
@@ -586,6 +593,7 @@ class AgentExecutor:
             on_progress=on_progress,
             mode_override=permission_mode,
             model=self.cfg.claude_model,
+            extra_env=extra_env,
         )
 
     # -- Codex ------------------------------------------------------------
@@ -597,6 +605,7 @@ class AgentExecutor:
         resume_session_id: str | None = None,
         on_progress: ProgressCallback | None = None,
         sandbox_override: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         sandbox = (
             sandbox_override if sandbox_override is not None else self.cfg.codex_sandbox
@@ -610,6 +619,7 @@ class AgentExecutor:
             on_progress=on_progress,
             mode_override=sandbox,
             model=self.cfg.codex_model,
+            extra_env=extra_env,
         )
 
     # -- 共通流程 ---------------------------------------------------------
@@ -623,6 +633,7 @@ class AgentExecutor:
         final_file: str | None = None,
         on_progress: ProgressCallback | None = None,
         session_id_hint: str | None = None,
+        extra_env: dict | None = None,
     ) -> ExecutionResult:
         timeout = timeout or self.cfg.timeout_seconds
         cwd = str(Path(cwd))
@@ -691,6 +702,7 @@ class AgentExecutor:
                     cwd=cwd,
                     stdin_text=prompt,
                     timeout=timeout,
+                    extra_env=extra_env,
                     on_stdout_chunk=stdout_progress,
                 )
             except FileNotFoundError:

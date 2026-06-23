@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 
 from cc_bridge.bridge import executor as ex
@@ -56,6 +57,44 @@ class _SequencedRun:
         if not self._responses:
             raise AssertionError("_run called more times than expected")
         return self._responses.pop(0)
+
+
+async def test_run_assigns_spawned_process_to_job(monkeypatch, tmp_path):
+    assigned_pids: list[int] = []
+    entered: list[bool] = []
+    exited: list[bool] = []
+
+    class FakeJob:
+        def assign(self, pid: int) -> bool:
+            assigned_pids.append(pid)
+            return True
+
+    class FakeJobContext:
+        def __enter__(self):
+            entered.append(True)
+            return FakeJob()
+
+        def __exit__(self, exc_type, exc, tb):
+            exited.append(True)
+            return False
+
+    monkeypatch.setattr(ex.jobobject, "kill_on_close_job", lambda: FakeJobContext())
+
+    out, err, code, timed_out = await ex._run(
+        [sys.executable, "-c", "pass"],
+        cwd=str(tmp_path),
+        stdin_text="",
+        timeout=10,
+    )
+
+    assert out == ""
+    assert err == ""
+    assert code == 0
+    assert timed_out is False
+    assert entered == [True]
+    assert exited == [True]
+    assert len(assigned_pids) == 1
+    assert assigned_pids[0] > 0
 
 
 # ---------------------------------------------------------------------------

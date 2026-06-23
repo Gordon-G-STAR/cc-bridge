@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cc-bridge"
-version = "0.1.1"
+version = "0.2.0"
 description = "Claude x Codex auto-collaboration bridge — let Claude Desktop call Codex and vice versa, using subscription quota (no API keys)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,11 @@ license = { text = "MIT" }
 authors = [{ name = "cc-bridge" }]
 keywords = ["mcp", "claude", "codex", "bridge", "agent"]
 dependencies = [
-    "mcp>=1.2.0",
+    # Upper bound is intentional: MCP SDK v2 (target 2026-07-28) reworks the core
+    # protocol + API with breaking changes. Without `<2`, the v2 stable release would
+    # silently satisfy this requirement and pull in a breaking major. Floor is the
+    # latest tested v1; the CI `deps-boundary` job probes 1.27 too (see ci.yml).
+    "mcp>=1.28,<2",
 ]
 
 [project.optional-dependencies]

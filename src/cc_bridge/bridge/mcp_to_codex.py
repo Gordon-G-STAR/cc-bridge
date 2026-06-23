@@ -13,16 +13,20 @@ ContextBuilder -> AgentExecutor.run_codex -> ResultParser。
 from __future__ import annotations
 
 import asyncio
-import time
+import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import config
+from . import config, evidence, policy
 from .audit import append_audit_record
 from .context import ContextBuilder, require_project_dir
+from .contracts import FailureKind, HandoffRequest, HandoffResult, fail_closed_result
 from .executor import AgentExecutor
+from .handoff import authorize, execution_to_handoff, handoff_goal_text, maybe_failover
+from .locks import LockBusy, async_project_lock
 from .parser import ResultParser
+from .progress import make_progress_callback as _make_progress_callback
 from .status import check_codex
 
 mcp = FastMCP("bridge-to-codex")
@@ -91,35 +95,6 @@ def _mark_dry_run_summary(summary: str) -> str:
     return f"{_DRY_RUN_SUMMARY_PREFIX}{summary}"
 
 
-def _make_progress_callback(ctx: Context | None):
-    """把 executor 的进度标签转成 MCP progress/info；任何异常都静默降级。"""
-    if ctx is None:
-        return None
-    state = {"count": 0, "last_message": "", "last_at": 0.0}
-
-    async def _on_progress(message: str) -> None:
-        try:
-            text = " ".join(str(message).split())
-            if not text or text == state["last_message"]:
-                return
-            now = time.monotonic()
-            if state["count"] and now - state["last_at"] < 0.25:
-                return
-            if len(text) > 240:
-                text = text[:237] + "..."
-            state["count"] += 1
-            state["last_message"] = text
-            state["last_at"] = now
-            await ctx.report_progress(
-                progress=float(state["count"]), total=None, message=text
-            )
-            await ctx.info(text)
-        except Exception:
-            pass
-
-    return _on_progress
-
-
 @mcp.tool(
     name="codex_execute",
     description=(
@@ -157,6 +132,18 @@ async def codex_execute(
     except (OSError, ValueError) as exc:
         return f"无法调用 Codex：{exc}"
     try:
+        # 同一条 policy 地板:legacy 工具与 handoff 共用本地策略(关闭开关 / 链深上限 / 引擎钳制),
+        # 绝无绕过 policy 的满权后门(F5 / #12)。dry_run 仍优先强制只读。
+        cfg = config.BridgeConfig.from_env()
+        legacy = policy.decide_legacy(
+            agent="codex",
+            policy=policy.LocalPolicy.from_env(),
+            chain=policy.ChainContext.from_env(),
+            codex_cap=cfg.codex_sandbox,
+            claude_cap=cfg.claude_permission_mode,
+        )
+        if legacy.refusal:
+            return legacy.refusal
         on_progress = _make_progress_callback(ctx)
         # 收集上下文（含 git 探测 + 目录遍历）放到线程里跑，绝不阻塞 MCP 事件循环，
         # 也保证工具可被宿主取消；底层 git 调用已硬化超时（见 config.git_capture）。
@@ -171,10 +158,12 @@ async def codex_execute(
             run_kwargs = {
                 "resume_session_id": resume_session_id,
                 "on_progress": on_progress,
+                "sandbox_override": (
+                    _DRY_RUN_CODEX_SANDBOX if dry_run else legacy.engine_mode
+                ),
+                "extra_env": legacy.child_env,
             }
-            if dry_run:
-                run_kwargs["sandbox_override"] = _DRY_RUN_CODEX_SANDBOX
-            result = await AgentExecutor().run_codex(prompt, cwd, **run_kwargs)
+            result = await AgentExecutor(cfg).run_codex(prompt, cwd, **run_kwargs)
             if result.session_id:
                 _remember_codex_session(cwd, result.session_id)
         append_audit_record(
@@ -195,6 +184,112 @@ async def codex_execute(
             "调用 Codex 时出现内部错误，未能完成任务。\n"
             f"错误信息：{exc}\n"
             "请确认 Codex 命令行已安装并已登录（codex login），再重试。"
+        )
+
+
+@mcp.tool(
+    name="codex_handoff",
+    description=(
+        "【v0.2 结构化委派】把一份结构化委派合同(HandoffRequest:目标 / 验收标准 / "
+        "申请的权限范围 requested_scope / 检查项 check_ids)交给 Codex,返回结构化结果 "
+        "HandoffResult。与 codex_execute 的区别:输入输出都是版本化结构,且 requested_scope "
+        "只是【申请】——由本地策略重授权(effective = requested ∩ 父链 ∩ 本地策略 ∩ 引擎上限);"
+        "申请超出策略会被收窄 / 降级为只读 / 拒绝;链深超限或需审批(headless)一律 fail-closed。"
+        "project_dir 必填、须为存在的绝对路径。"
+    ),
+)
+async def codex_handoff(
+    request: HandoffRequest,
+    project_dir: str | None = None,
+    continue_session: bool = False,
+    ctx: Context = None,
+) -> HandoffResult:
+    """把结构化合同交给 Codex(经本地策略重授权),返回 HandoffResult,绝不向 MCP 抛异常。"""
+    handoff_id = uuid.uuid4().hex[:12]
+    try:
+        cwd = str(Path(require_project_dir(project_dir)).resolve())
+    except (OSError, ValueError) as exc:
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.invalid_contract,
+            reason=f"project_dir 无效:{exc}",
+            status="failed",
+        )
+    try:
+        cfg = config.BridgeConfig.from_env()
+        # 本地策略重授权:deny / approval_required / 链深超限 => fail-closed,绝不执行。
+        plan = authorize(handoff_id, request, cwd, agent="codex", cfg=cfg)
+        if isinstance(plan, HandoffResult):
+            return plan
+
+        before = evidence.baseline(cwd)
+        on_progress = _make_progress_callback(ctx)
+        project_ctx = await asyncio.to_thread(
+            ContextBuilder().build_project_context, cwd
+        )
+        prompt = ContextBuilder().build_task_prompt(
+            handoff_goal_text(request), project_ctx, caller="claude"
+        )
+        async with async_project_lock(cwd, timeout=5.0), _codex_session_lock(cwd):
+            resume_session_id = (
+                _CODEX_SESSIONS_BY_PROJECT.get(cwd) if continue_session else None
+            )
+            result = await AgentExecutor(cfg).run_codex(
+                prompt,
+                cwd,
+                timeout=request.timeout_seconds,
+                resume_session_id=resume_session_id,
+                on_progress=on_progress,
+                sandbox_override=plan.engine_mode,
+                extra_env=plan.child_env,
+            )
+            if result.session_id:
+                _remember_codex_session(cwd, result.session_id)
+        ev = evidence.gather(cwd, before, writable_paths=plan.effective_writable)
+        parsed = ResultParser().parse(result, "codex")
+        summary = ResultParser().summarize_for_caller(parsed, "codex")
+        primary_result = execution_to_handoff(
+            handoff_id, request, result, summary, "codex", evidence=ev, plan=plan
+        )
+        # PR7:主 agent 若【可证明零副作用】且合同允许,透明 failover 到 Claude。
+        final = await maybe_failover(
+            primary_result,
+            primary_agent="codex",
+            request=request,
+            cwd=cwd,
+            cfg=cfg,
+            caller="claude",
+            on_progress=on_progress,
+        )
+        append_audit_record(
+            direction="codex",
+            cwd=cwd,
+            task=handoff_goal_text(request),
+            success=final.status == "completed",
+            files_changed=final.verified_files_changed,
+            extra={
+                "mode": "handoff",
+                "depth": plan.depth,
+                "write_granted": plan.write_granted,
+                "effective_writable": list(plan.effective_writable),
+                "agent_used": final.agent_used,
+                "failover": final.agent_used not in (None, "codex"),
+            },
+        )
+        return final
+    except LockBusy:
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.project_busy,
+            reason="Another bridge process is handling this project; try again shortly.",
+            status="failed",
+        )
+    except Exception as exc:  # noqa: BLE001 — 兜底,绝不向 MCP 抛异常
+        return fail_closed_result(
+            handoff_id,
+            failure_kind=FailureKind.crashed,
+            reason=f"调用 Codex 时内部错误:{exc}",
+            status="failed",
         )
 
 

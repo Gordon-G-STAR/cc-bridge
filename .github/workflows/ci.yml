@@ -50,3 +50,35 @@ jobs:
 
       - name: Run ruff
         run: ruff check .
+
+  deps-boundary:
+    # Verifies the package works across the declared mcp v1 range, and probes 1.27 as
+    # evidence for whether the floor in pyproject.toml could be lowered. The `<2` upper
+    # bound guards against MCP SDK v2's breaking core/API rework (target 2026-07-28).
+    name: Deps boundary (mcp ${{ matrix.mcp-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp-version: ["1.27.0", "1.28.0"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install package (with dev extras)
+        run: pip install -e .[dev]
+
+      - name: Pin mcp to boundary version
+        run: pip install "mcp==${{ matrix.mcp-version }}"
+
+      - name: Run tests
+        run: pytest -m "not integration" -q
