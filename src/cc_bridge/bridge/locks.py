@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from cc_bridge.bridge import config
+from cc_bridge.bridge import config, wal
 
 if sys.platform == "win32":
     import msvcrt
@@ -76,6 +76,22 @@ def _unlock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def _resume_pending_rollbacks(project_dir: str | os.PathLike[str]) -> None:
+    """锁拿到后、放行新 handoff 前,续完上次崩溃中断的回滚(WAL acquire-scan)。"""
+    try:
+        for handoff_id in wal.pending_rollbacks():
+            manifest = wal._read_manifest(handoff_id)
+            if not isinstance(manifest, dict):
+                continue
+            to_revert = manifest.get("to_revert", [])
+            reverted = set(manifest.get("reverted", []))
+            remaining = [p for p in to_revert if p not in reverted]
+            if remaining:
+                wal.rollback(handoff_id, str(project_dir), remaining)
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def project_lock(
     project_dir: str | os.PathLike[str],
@@ -101,6 +117,7 @@ def project_lock(
                     f"handling this project; key={_lock_key(project_dir)}"
                 )
             time.sleep(min(poll, remaining))
+        _resume_pending_rollbacks(project_dir)
         yield path
     finally:
         try:

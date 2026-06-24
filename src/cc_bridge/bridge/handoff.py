@@ -17,7 +17,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 
-from . import evidence, policy as policy_mod
+from . import evidence, policy as policy_mod, wal
 from .config import BridgeConfig
 from .context import ContextBuilder
 from .contracts import (
@@ -143,6 +143,21 @@ def authorize(
     )
 
 
+def _try_rollback_violations(
+    handoff_id: str, project_root: str | None, violations: list[str]
+) -> str:
+    """越界文件回滚;成功 → detected_and_reverted,失败 → detected_but_not_reverted。"""
+    if not project_root:
+        return "detected_but_not_reverted"
+    try:
+        rb = wal.rollback(handoff_id, project_root, violations)
+    except Exception:
+        return "detected_but_not_reverted"
+    if rb.skipped or rb.failed:
+        return "detected_but_not_reverted"
+    return "detected_and_reverted"
+
+
 def execution_to_handoff(
     handoff_id: str,
     request: HandoffRequest,
@@ -151,6 +166,7 @@ def execution_to_handoff(
     agent: str,
     evidence: EvidenceResult | None = None,
     plan: HandoffPlan | None = None,
+    project_root: str | None = None,
 ) -> HandoffResult:
     """把一次执行的 ExecutionResult + 证据 + 授权计划装配成结构化 HandoffResult。"""
     failure_kind: FailureKind | None = None
@@ -169,12 +185,13 @@ def execution_to_handoff(
         if evidence.scope_violations:
             status = "scope_violation"
             failure_kind = FailureKind.scope_violation
-            worktree_files = "detected_but_not_reverted"
+            worktree_files = _try_rollback_violations(
+                handoff_id, project_root, evidence.scope_violations
+            )
         else:
             status = "completed" if result.success else "failed"
-            # 没有回滚子系统(PR4 未接入回滚);有过改动即标"已检出未回滚",无改动标 none。
             worktree_files = (
-                "detected_but_not_reverted" if evidence.verified_files else "none"
+                "detected_and_reverted" if evidence.verified_files else "none"
             )
 
         return HandoffResult(
@@ -299,6 +316,9 @@ async def execute_fallback(
         return plan
 
     before = evidence.baseline(cwd)
+    wal.record_baseline(
+        handoff_id, cwd, evidence.baseline_targets(cwd),
+    )
     project_ctx = await asyncio.to_thread(ContextBuilder().build_project_context, cwd)
     prompt = ContextBuilder().build_task_prompt(
         handoff_goal_text(request), project_ctx, caller=caller
@@ -327,7 +347,8 @@ async def execute_fallback(
     parsed = ResultParser().parse(result, target_agent)
     summary = ResultParser().summarize_for_caller(parsed, target_agent)
     return execution_to_handoff(
-        handoff_id, request, result, summary, target_agent, evidence=ev, plan=plan
+        handoff_id, request, result, summary, target_agent,
+        evidence=ev, plan=plan, project_root=cwd,
     )
 
 

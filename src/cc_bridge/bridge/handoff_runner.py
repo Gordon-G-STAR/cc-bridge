@@ -6,7 +6,7 @@ import asyncio
 import os
 import sys
 
-from . import config, evidence, handoff
+from . import config, evidence, handoff, wal
 from .context import ContextBuilder
 from .contracts import FailureKind, HandoffResult, fail_closed_result
 from .executor import AgentExecutor, ExecutionResult
@@ -78,6 +78,9 @@ async def run_spec(handoff_id: str) -> None:
             return
 
         before = evidence.baseline(cwd)
+        wal.record_baseline(
+            handoff_id, cwd, evidence.baseline_targets(cwd),
+        )
         builder = ContextBuilder()
         project_ctx = await asyncio.to_thread(builder.build_project_context, cwd)
         prompt = builder.build_task_prompt(
@@ -107,6 +110,7 @@ async def run_spec(handoff_id: str) -> None:
             agent,
             evidence=ev,
             plan=plan,
+            project_root=cwd,
         )
         write_result(handoff_id, handoff_result)
         write_status(handoff_id, handoff_result.status)

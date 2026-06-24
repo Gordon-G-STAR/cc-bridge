@@ -24,6 +24,10 @@ def baseline(root) -> dict[str, str | None]:
     return snapshot.snapshot_files(root, snapshot.list_snapshot_targets(root))
 
 
+def baseline_targets(root) -> list[str]:
+    return snapshot.list_snapshot_targets(root)
+
+
 def gather(root, baseline_snapshot, writable_paths=()) -> EvidenceResult:
     targets = snapshot.list_snapshot_targets(root)
     after = snapshot.snapshot_files(root, targets)
