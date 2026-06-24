@@ -26,6 +26,6 @@ pytest -m "not integration"           # 全平台;Windows 专属项在 windows-l
 ## 仍待补(诚实清单)
 
 - **POSIX 下 detached 孙进程的进程树静默** —— Windows 由 Job Object 兜底(已验证);POSIX 无 Job Object,正常完成路径下脱离会话组(`setsid`)的孙进程不被杀。需补 POSIX 侧的进程组 / cgroup 兜底。
-- **PR4 的 WAL + 逐文件回滚** —— 未做;有改动的成功 handoff 一律标 `detected_but_not_reverted`(见 [`v0.2-roadmap.md`](v0.2-roadmap.md) 的「实现状态」)。
+- ~~**PR4 的 WAL + 逐文件回滚**~~ —— **已实现(v0.4.1)**:越界改动由 content-WAL 回滚(`detected_and_reverted`);崩溃中断的回滚在下次 `project_lock` acquire 时自动续完。
 
-> 一句话:Windows 路径形态(硬链接 / junction / ADS / 保留名)、skip-worktree / filter 哈希、Job Object 全链杀、**以及 detached 孙进程「快照后写」** 都已在 `windows-latest` CI 实跑验证;剩 POSIX 侧孙进程兜底与 PR4 回滚。
+> 一句话:Windows 路径形态(硬链接 / junction / ADS / 保留名)、skip-worktree / filter 哈希、Job Object 全链杀、detached 孙进程「快照后写」、**WAL 逐文件回滚** 都已验证;剩 POSIX 侧孙进程兜底。
